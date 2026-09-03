@@ -104,7 +104,7 @@ export async function POST(req: NextRequest) {
         s3Key,
         documentType,
         courseCode: course.code,
-        year: year || 2024
+        year: year || null
       })
     }).catch((err) => {
       // Worker offline or busy; job remains PENDING in database

@@ -2,5 +2,6 @@ fastapi[standard]
 pydantic
 pytesseract
 PyMuPDF
-boto3
+Pillow
+httpx
 python-dotenv
