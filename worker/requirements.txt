@@ -1,0 +1,6 @@
+fastapi[standard]
+pydantic
+pytesseract
+PyMuPDF
+boto3
+python-dotenv

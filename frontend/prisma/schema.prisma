@@ -1,0 +1,115 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Course {
+  id        String          @id @default(cuid())
+  code      String          @unique
+  title     String
+  credits   Int
+  modules   Module[]
+  papers    Paper[]
+  materials StudyMaterial[]
+}
+
+model Module {
+  id       String  @id @default(cuid())
+  courseId String
+  course   Course  @relation(fields: [courseId], references: [id])
+  moduleNo Int
+  name     String
+  topics   Topic[]
+
+  @@unique([courseId, moduleNo])
+}
+
+model Topic {
+  id             String          @id @default(cuid())
+  moduleId       String
+  module         Module          @relation(fields: [moduleId], references: [id])
+  topicName      String
+  questionTopics QuestionTopic[]
+}
+
+model File {
+  id           String          @id @default(cuid())
+  s3Key        String          @unique
+  sha256Hash   String          @unique
+  uploadedAt   DateTime        @default(now())
+  
+  submissions  Submission[]
+  jobs         ProcessingJob[]
+  papers       Paper[]
+  materials    StudyMaterial[]
+}
+
+model Submission {
+  id            String   @id @default(cuid())
+  fileId        String
+  file          File     @relation(fields: [fileId], references: [id])
+  contributorId String?  // Using a string ID for now since authentication models are skipped in Release 1
+  status        String   // e.g. PENDING, APPROVED, REJECTED
+  submittedAt   DateTime @default(now())
+}
+
+model Paper {
+  id        String     @id @default(cuid())
+  fileId    String
+  file      File       @relation(fields: [fileId], references: [id])
+  courseId  String
+  course    Course     @relation(fields: [courseId], references: [id])
+  examType  String     // e.g., CAT1, CAT2, FAT
+  year      Int?
+  
+  questions Question[]
+}
+
+model Question {
+  id               String          @id @default(cuid())
+  paperId          String
+  paper            Paper           @relation(fields: [paperId], references: [id])
+  questionNumber   String          // e.g., "Q5(a)", "Q5(b)"
+  marks            Float?
+  extractedText    String
+  imageCropS3Key   String?
+  
+  questionTopics   QuestionTopic[]
+}
+
+model QuestionTopic {
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  topicId    String
+  topic      Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  confidence Float?
+
+  @@id([questionId, topicId])
+}
+
+model StudyMaterial {
+  id           String @id @default(cuid())
+  courseId     String
+  course       Course @relation(fields: [courseId], references: [id])
+  fileId       String
+  file         File   @relation(fields: [fileId], references: [id])
+  title        String
+  documentType String // e.g., PPT, NOTES, REFERENCE
+}
+
+model ProcessingJob {
+  id            String   @id @default(cuid())
+  fileId        String
+  file          File     @relation(fields: [fileId], references: [id])
+  status        String   // e.g. PENDING, DOWNLOADING, VALIDATING, TEXT_EXTRACTION, OCR_PROCESSING, QUESTION_SEGMENTATION, CLASSIFICATION, REVIEW_REQUIRED, COMPLETED, FAILED
+  stage         String?
+  errorCategory String?
+  durationMs    Int?
+  retryCount    Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
