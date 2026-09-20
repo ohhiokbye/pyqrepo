@@ -1,15 +1,41 @@
 import os
+import re
 import json
+import hashlib
 import tempfile
 import pymupdf
 import httpx
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from src.providers.storage import get_storage_provider
 from src.providers.ocr import get_ocr_provider
 from src.providers.llm import get_llm_provider
 
 # Configurable confidence threshold from engineering specification
 CONFIDENCE_THRESHOLD = 0.80
+
+def _detect_year(text: str) -> Optional[int]:
+    """Detect academic year from text headers, e.g. 'March 2025', '2024-25', 'Winter 2024', '2023'."""
+    # Academic year range e.g. 2024-25 or 2024-2025 -> pick later year
+    range_match = re.search(r'\b20(\d{2})[-/](?:20)?(\d{2})\b', text)
+    if range_match:
+        y2 = int(range_match.group(2))
+        return 2000 + y2 if y2 < 100 else y2
+
+    # Month / Term + Year e.g. "March 2025", "Winter 2024"
+    term_match = re.search(
+        r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|fall|winter|spring|summer)\s+[\'"]?(201\d|202\d)\b',
+        text,
+        re.IGNORECASE
+    )
+    if term_match:
+        return int(term_match.group(1))
+
+    # Standard 4-digit year (2015-2029)
+    year_match = re.search(r'\b(201[5-9]|202[0-9])\b', text)
+    if year_match:
+        return int(year_match.group(1))
+
+    return None
 
 class DocumentProcessor:
     def __init__(self):
@@ -36,6 +62,17 @@ class DocumentProcessor:
         except Exception as e:
             print(f"[Pipeline] Could not fetch course topics: {e}")
         return []
+
+    def _check_duplicate_hash(self, file_hash: str, job_id: str) -> Optional[Dict]:
+        """Check if an identical file has already been ingested into PostgreSQL."""
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                res = client.get(f"http://localhost:3000/api/files/check-hash?hash={file_hash}&jobId={job_id}")
+                if res.status_code == 200:
+                    return res.json()
+        except Exception as err:
+            print(f"[Pipeline] Duplicate check notice ({err}). Proceeding with standard ingestion.")
+        return None
 
     def process_job(self, job_id: str, file_record: dict) -> dict:
         """
@@ -71,6 +108,39 @@ class DocumentProcessor:
                 "stage": "DOWNLOADING",
                 "error": f"File '{s3_key}' not found in storage."
             }
+
+        # SHA-256 Duplicate PDF Detection
+        file_hash = None
+        try:
+            with open(local_path, 'rb') as f:
+                file_hash = hashlib.sha256(f.read()).hexdigest()
+            print(f"[Pipeline] SHA-256: {file_hash}")
+        except Exception as hash_err:
+            print(f"[Pipeline] Hash computation error: {hash_err}")
+
+        if file_hash:
+            dupe_check = self._check_duplicate_hash(file_hash, job_id)
+            if dupe_check and dupe_check.get('exists'):
+                existing_questions = dupe_check.get('questions', [])
+                existing_year = dupe_check.get('year') or year
+                print(f"[Pipeline] Exact duplicate PDF detected (matches existing file {dupe_check.get('existingFileId')})!")
+                print(f"[Pipeline] Reusing {len(existing_questions)} pre-extracted questions. Zero GPU/LLM calls needed.")
+                self._update_job_status(job_id, "COMPLETED", "COMPLETED", [], existing_questions, year=existing_year, file_hash=file_hash)
+                try:
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                return {
+                    "success": True,
+                    "jobId": job_id,
+                    "documentType": document_type,
+                    "status": "COMPLETED",
+                    "duplicate": True,
+                    "existingFileId": dupe_check.get('existingFileId'),
+                    "questions": existing_questions,
+                    "questionsCount": len(existing_questions)
+                }
 
         # ------------------------------------------------------------------
         # Stage 2: EXTRACTION
@@ -113,31 +183,124 @@ class DocumentProcessor:
         # Generate question crop paths & classify topics
         current_dir = os.path.dirname(os.path.abspath(__file__))
         root_dir = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
+        if not year:
+            year = _detect_year(extracted_text)
+
         year_label = str(year) if year else "unknown"
         crops_dir = os.path.join(root_dir, 'local_storage', 'crops', str(course_code), year_label)
         os.makedirs(crops_dir, exist_ok=True)
 
+        # Map each question to its corresponding PDF page and generate accurate crop
+        pages_raw = re.split(r'--- (?:Question Paper Page|Slide/Page|Page) (\d+) ---', extracted_text)
+        page_texts: Dict[int, str] = {}
+        for i in range(1, len(pages_raw), 2):
+            try:
+                page_texts[int(pages_raw[i])] = pages_raw[i + 1]
+            except (ValueError, IndexError):
+                pass
+
+        try:
+            pdf_doc = pymupdf.open(local_path)
+        except Exception as doc_err:
+            print(f"[Pipeline] Could not open PDF for crop extraction: {doc_err}")
+            pdf_doc = None
+
+        # 1. Determine target page for each question via keyword overlap
+        for q in questions:
+            target_page_idx = 0
+            if page_texts:
+                best_overlap = -1
+                q_words = set(re.findall(r'\w{3,}', q.get('extractedText', '').lower()))
+                for p_num, p_txt in page_texts.items():
+                    p_words = set(re.findall(r'\w{3,}', p_txt.lower()))
+                    overlap = len(q_words.intersection(p_words))
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        target_page_idx = max(0, p_num - 1)
+            q['target_page_idx'] = target_page_idx
+
+        # 2. Extract crops grouped by page with accurate bounding boxes
+        if pdf_doc:
+            for p_idx in range(len(pdf_doc)):
+                page_obj = pdf_doc[p_idx]
+                page_qs = [q for q in questions if q.get('target_page_idx', 0) == p_idx]
+                if not page_qs:
+                    continue
+
+                # Locate vertical start coordinate (y0) for each question on this page
+                located_qs = []
+                for idx, q in enumerate(page_qs):
+                    q_num = q.get('questionNumber', 'Q')
+                    search_rects = page_obj.search_for(q_num)
+                    y0 = -1
+                    if search_rects:
+                        y0 = search_rects[0].y0
+                    else:
+                        # Search by distinctive words from question start
+                        words = [w for w in re.findall(r'[A-Za-z0-9]+', q.get('extractedText', '')) if len(w) > 3][:4]
+                        if len(words) >= 2:
+                            s_rects = page_obj.search_for(' '.join(words[:2]))
+                            if s_rects:
+                                y0 = s_rects[0].y0
+                        if y0 == -1 and words:
+                            s_rects = page_obj.search_for(words[0])
+                            if s_rects:
+                                y0 = s_rects[0].y0
+                    located_qs.append((q, y0, idx))
+
+                page_h = page_obj.rect.height
+                page_w = page_obj.rect.width
+                total_in_page = len(page_qs)
+
+                for q, y0, idx in located_qs:
+                    q_num = q.get('questionNumber', 'Q')
+                    clean_q_num = q_num.replace("(", "").replace(")", "").replace(" ", "_")
+                    crop_rel_path = f"crops/{course_code}/{year_label}/{clean_q_num}.png"
+                    crop_abs_path = os.path.join(crops_dir, f"{clean_q_num}.png")
+                    q['imageCropS3Key'] = crop_rel_path
+
+                    if y0 >= 0:
+                        top_y = max(0, y0 - 15)
+                        next_y = page_h
+                        for _, next_y0_cand, _ in located_qs:
+                            if next_y0_cand > y0 + 15 and next_y0_cand < next_y:
+                                next_y = next_y0_cand
+                        bot_y = min(page_h, max(top_y + 150, next_y - 5))
+                        clip_rect = pymupdf.Rect(0, top_y, page_w, bot_y)
+                    else:
+                        # Proportional vertical band slice (guarantees question snippet, never full page)
+                        band_h = page_h / total_in_page
+                        clip_rect = pymupdf.Rect(0, band_h * idx, page_w, band_h * (idx + 1))
+
+                    try:
+                        pix = page_obj.get_pixmap(clip=clip_rect, dpi=150)
+                        pix.save(crop_abs_path)
+                    except Exception as crop_err:
+                        print(f"[Pipeline] Crop generation note for {clean_q_num}: {crop_err}")
+
+            pdf_doc.close()
+
+        # 3. Topic classification for ALL questions — single batch API call
+        # Ensure every question has its imageCropS3Key set
         for q in questions:
             q_num = q.get('questionNumber', 'Q')
             clean_q_num = q_num.replace("(", "").replace(")", "").replace(" ", "_")
-            crop_rel_path = f"crops/{course_code}/{year_label}/{clean_q_num}.png"
-            q['imageCropS3Key'] = crop_rel_path
+            if 'imageCropS3Key' not in q:
+                q['imageCropS3Key'] = f"crops/{course_code}/{year_label}/{clean_q_num}.png"
 
-            # Create an image crop placeholder for verification
-            crop_abs_path = os.path.join(crops_dir, f"{clean_q_num}.png")
-            if not os.path.exists(crop_abs_path):
-                try:
-                    doc = pymupdf.open(local_path)
-                    if len(doc) > 0:
-                        pix = doc[0].get_pixmap(dpi=150)
-                        pix.save(crop_abs_path)
-                    doc.close()
-                except Exception:
-                    pass
+        # Batch classify: 1 Gemini call for ALL questions instead of N calls
+        batch_results = self.llm.classify_questions_batch(questions, candidate_topics=candidate_topics or None)
 
-            classification = self.llm.classify_question(q['extractedText'], candidate_topics=candidate_topics or None)
-            topic = classification.get('topicName', 'General')
-            conf = classification.get('confidence', 0.85)
+        # Build lookup from batch results
+        batch_lookup: Dict[str, Dict] = {}
+        for br in batch_results:
+            batch_lookup[br.get('questionNumber', '')] = br
+
+        for q in questions:
+            q_num = q.get('questionNumber', 'Q')
+            match = batch_lookup.get(q_num, {})
+            topic = match.get('topicName', 'General')
+            conf = float(match.get('confidence', 0.85))
             q['topic'] = topic
             q['confidence'] = conf
 
@@ -157,7 +320,7 @@ class DocumentProcessor:
         # ------------------------------------------------------------------
         # Stage 6: UPDATE DATABASE STATUS & PERSIST QUESTIONS
         # ------------------------------------------------------------------
-        self._update_job_status(job_id, final_status, "COMPLETED", low_confidence_reasons, questions)
+        self._update_job_status(job_id, final_status, "COMPLETED", low_confidence_reasons, questions, year=year, file_hash=file_hash)
 
         # Cleanup local working copy
         try:
@@ -177,19 +340,25 @@ class DocumentProcessor:
             "extractedTextLength": len(extracted_text)
         }
 
-    def _update_job_status(self, job_id: str, status: str, stage: str, review_reasons: List[str], questions: List[Dict]):
+    def _update_job_status(self, job_id: str, status: str, stage: str, review_reasons: List[str], questions: List[Dict], year: Any = None, file_hash: str = None):
         """Persist job status and extracted questions back to PostgreSQL via the Next.js API."""
         try:
+            payload = {
+                "jobId": job_id,
+                "status": status,
+                "stage": stage,
+                "reviewReasons": review_reasons,
+                "questions": questions
+            }
+            if year:
+                payload["year"] = int(year)
+            if file_hash:
+                payload["fileHash"] = file_hash
+
             with httpx.Client(timeout=15.0) as client:
                 update_res = client.post(
                     "http://localhost:3000/api/jobs/update",
-                    json={
-                        "jobId": job_id,
-                        "status": status,
-                        "stage": stage,
-                        "reviewReasons": review_reasons,
-                        "questions": questions
-                    }
+                    json=payload
                 )
                 if update_res.status_code == 200:
                     print(f"[Pipeline] Successfully persisted status '{status}' and {len(questions)} questions in PostgreSQL.")

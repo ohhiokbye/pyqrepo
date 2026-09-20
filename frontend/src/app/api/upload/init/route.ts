@@ -30,7 +30,7 @@ export async function POST(req: NextRequest) {
     const result = uploadInitSchema.safeParse(body)
     
     if (!result.success) {
-      return NextResponse.json({ error: 'Invalid payload', details: result.error.errors }, { status: 400 })
+      return NextResponse.json({ error: 'Invalid payload', details: result.error.issues }, { status: 400 })
     }
 
     const { fileName, mimeType, fileSize, documentType } = result.data

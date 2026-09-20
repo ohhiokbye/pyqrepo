@@ -1,14 +1,14 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    network_mode: host
+    command: ["postgres", "-p", "5433", "-c", "listen_addresses=127.0.0.1,localhost"]
     environment:
       POSTGRES_USER: cpyq_user
-      POSTGRES_PASSWORD: cpyq_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cpyq_password}
       POSTGRES_DB: cpyq
-    ports:
-      - "5433:5432"
     volumes:
-    
       - pgdata:/var/lib/postgresql/data
 
 volumes:

@@ -16,10 +16,16 @@ class LocalFileSystemProvider(StorageProvider):
     
     def download_file(self, s3_key: str, local_path: str) -> bool:
         # Prevent path traversal
-        clean_key = s3_key.lstrip('/')
-        source_path = os.path.join(self.base_dir, clean_key)
+        clean_key = os.path.normpath(s3_key).lstrip("/\\")
+        base_dir_abs = os.path.abspath(self.base_dir)
+        source_path = os.path.abspath(os.path.join(base_dir_abs, clean_key))
         
-        if not os.path.exists(source_path):
+        # Enforce canonical path boundary
+        if not source_path.startswith(base_dir_abs + os.sep):
+            print(f"[Storage] Path traversal attempt blocked: {s3_key}")
+            return False
+        
+        if not os.path.exists(source_path) or not os.path.isfile(source_path):
             print(f"[Storage] File not found at: {source_path}")
             return False
         

@@ -19,8 +19,9 @@ export class LocalFileSystemProvider implements StorageProvider {
     }
   }
 
-  async generateUploadUrl(fileName: string, mimeType: string, maxSizeInBytes: number) {
-    const s3Key = `uploads/submissions/${uuidv4()}-${fileName}`
+  async generateUploadUrl(fileName: string, mimeType: string, maxSizeInBytes: number): Promise<{ url: string; s3Key: string }> {
+    const cleanFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_')
+    const s3Key = `uploads/submissions/${uuidv4()}-${cleanFileName}`
     // In local dev, we return an endpoint in our own Next.js app that will handle the file write
     const url = `http://localhost:3000/api/local-upload?key=${encodeURIComponent(s3Key)}`
     
@@ -29,7 +30,7 @@ export class LocalFileSystemProvider implements StorageProvider {
 }
 
 export class S3StorageProvider implements StorageProvider {
-  async generateUploadUrl(fileName: string, mimeType: string, maxSizeInBytes: number) {
+  async generateUploadUrl(fileName: string, mimeType: string, maxSizeInBytes: number): Promise<{ url: string; s3Key: string }> {
     // To be implemented using AWS SDK (S3 Presigned URLs)
     throw new Error('S3 provider not implemented yet.')
   }
