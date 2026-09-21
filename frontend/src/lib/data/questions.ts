@@ -1,5 +1,6 @@
 import { prisma } from '@/lib/db'
-import type { QuestionFilters, QuestionResult, PaginatedQuestions, CourseWithModules } from '@/lib/types'
+import type { QuestionFilters, PaginatedQuestions, CourseWithModules } from '@/lib/types'
+import { toQuestionResult } from './toQuestionResult'
 
 const DEFAULT_LIMIT = 20
 const MAX_LIMIT = 100
@@ -63,39 +64,7 @@ export async function getQuestions(filters: QuestionFilters): Promise<PaginatedQ
     }),
   ])
 
-  const formatted: QuestionResult[] = questions.map((q) => {
-    const primaryTopic = q.questionTopics[0]
-    return {
-      id: q.id,
-      questionNumber: q.questionNumber,
-      marks: q.marks,
-      extractedText: q.extractedText,
-      imageCropS3Key: q.imageCropS3Key,
-      cropUrl: q.imageCropS3Key ? `/api/crops/${q.imageCropS3Key}` : null,
-      paper: {
-        id: q.paper.id,
-        examType: q.paper.examType,
-        year: q.paper.year,
-      },
-      course: {
-        id: q.paper.course.id,
-        code: q.paper.course.code,
-        title: q.paper.course.title,
-      },
-      primaryTopic: primaryTopic
-        ? {
-            id: primaryTopic.topic.id,
-            name: primaryTopic.topic.topicName,
-            confidence: primaryTopic.confidence,
-          }
-        : null,
-      topics: q.questionTopics.map((qt) => ({
-        id: qt.topic.id,
-        name: qt.topic.topicName,
-        confidence: qt.confidence,
-      })),
-    }
-  })
+  const formatted = questions.map((q) => toQuestionResult(q, q.paper))
 
   return {
     total,

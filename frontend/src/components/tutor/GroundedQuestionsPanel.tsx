@@ -2,6 +2,7 @@
 
 import type { QuestionResult } from '@/lib/types'
 import { CropPreview } from '@/app/questions/CropPreview'
+import { cleanText } from '@/lib/text'
 import { useState } from 'react'
 
 type Props = {
@@ -144,13 +145,4 @@ export function GroundedQuestionsPanel({
       </div>
     </aside>
   )
-}
-
-function cleanText(text: string): string {
-  return text
-    .replace(/---\s*Question Paper Page \d+\s*---/g, '')
-    .replace(/---\s*Slide\/Page \d+\s*---/g, '')
-    .replace(/---\s*Page \d+\s*---/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
 }

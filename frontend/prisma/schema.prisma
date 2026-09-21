@@ -39,7 +39,9 @@ model Topic {
 model File {
   id           String          @id @default(cuid())
   s3Key        String          @unique
-  sha256Hash   String          @unique
+  // Nullable until the worker computes the real hash; Postgres allows multiple
+  // NULLs under a unique constraint, so this needs no placeholder value.
+  sha256Hash   String?         @unique
   uploadedAt   DateTime        @default(now())
   
   submissions  Submission[]
@@ -77,8 +79,18 @@ model Question {
   marks            Float?
   extractedText    String
   imageCropS3Key   String?
-  
+
+  // pgvector column (gemini-embedding-001, 768 dims) used for semantic retrieval:
+  // lets the tutor find questions that match a student's meaning, not just their
+  // exact wording. Prisma can't read/write "Unsupported" columns directly - all
+  // access goes through $queryRaw/$executeRaw (see lib/embeddings.ts). Managed by
+  // hand via SQL (see migration in WALKTHROUGH.md / project.md), not `db push`.
+  embedding        Unsupported("vector(768)")?
+
   questionTopics   QuestionTopic[]
+
+  // Prevents duplicate question rows when a job is retried or double-processed.
+  @@unique([paperId, questionNumber])
 }
 
 model QuestionTopic {
@@ -105,7 +117,7 @@ model ProcessingJob {
   id            String   @id @default(cuid())
   fileId        String
   file          File     @relation(fields: [fileId], references: [id])
-  status        String   // e.g. PENDING, DOWNLOADING, VALIDATING, TEXT_EXTRACTION, OCR_PROCESSING, QUESTION_SEGMENTATION, CLASSIFICATION, REVIEW_REQUIRED, COMPLETED, FAILED
+  status        String   // e.g. PENDING, PROCESSING (claimed by a worker), DOWNLOADING, VALIDATING, TEXT_EXTRACTION, OCR_PROCESSING, QUESTION_SEGMENTATION, CLASSIFICATION, REVIEW_REQUIRED, COMPLETED, FAILED
   stage         String?
   errorCategory String?
   durationMs    Int?

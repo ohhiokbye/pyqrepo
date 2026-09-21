@@ -7,9 +7,10 @@ type Props = {
   page: number
   totalPages: number
   total: number
+  itemLabel?: string
 }
 
-export function Pagination({ page, totalPages, total }: Props) {
+export function Pagination({ page, totalPages, total, itemLabel = 'item' }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -35,7 +36,7 @@ export function Pagination({ page, totalPages, total }: Props) {
       aria-label="Pagination"
     >
       <p className="text-xs text-muted-foreground">
-        {total} question{total !== 1 ? 's' : ''} total
+        {total} {itemLabel}{total !== 1 ? 's' : ''} total
       </p>
       <div className="flex items-center gap-2">
         <button

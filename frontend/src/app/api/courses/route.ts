@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { apiError } from '@/lib/apiError'
 
 export async function GET() {
   try {
@@ -16,13 +17,6 @@ export async function GET() {
 
     return NextResponse.json({ courses })
   } catch (error) {
-    console.error('Failed to fetch courses:', error)
-    return NextResponse.json(
-      {
-        error: 'Failed to connect to database or fetch courses',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 }
-    )
+    return apiError('Failed to fetch courses:', error, 'Failed to fetch courses.')
   }
 }

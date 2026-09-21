@@ -6,6 +6,9 @@ services:
     command: ["postgres", "-p", "5433", "-c", "listen_addresses=127.0.0.1,localhost"]
     environment:
       POSTGRES_USER: cpyq_user
+      # The default below only matters if POSTGRES_PASSWORD is unset. It's fine for
+      # local dev since Postgres binds to 127.0.0.1/localhost only (see `command`
+      # above), but set POSTGRES_PASSWORD explicitly for any shared/deployed environment.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cpyq_password}
       POSTGRES_DB: cpyq
     volumes:

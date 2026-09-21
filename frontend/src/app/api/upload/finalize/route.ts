@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { z } from 'zod'
-import crypto from 'crypto'
+import { apiError } from '@/lib/apiError'
+import { checkRateLimit, getClientIdentifier } from '@/lib/rateLimit'
+
+const WORKER_URL = process.env.WORKER_URL || 'http://localhost:8000'
+
+// The upload passphrase is a single shared secret with no lockout, so guard
+// against brute-force guessing with a per-IP attempt limit.
+const PASSPHRASE_ATTEMPT_LIMIT = 10
+const PASSPHRASE_ATTEMPT_WINDOW_MS = 15 * 60 * 1000 // 15 minutes
 
 const finalizeSchema = z.object({
   s3Key: z.string().min(1),
@@ -15,6 +23,10 @@ const finalizeSchema = z.object({
 })
 
 export async function POST(req: NextRequest) {
+  if (!checkRateLimit(`upload-finalize:${getClientIdentifier(req)}`, PASSPHRASE_ATTEMPT_LIMIT, PASSPHRASE_ATTEMPT_WINDOW_MS)) {
+    return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 })
+  }
+
   const authHeader = req.headers.get('authorization')
   const expectedPassphrase = process.env.UPLOAD_PASSPHRASE
 
@@ -43,15 +55,10 @@ export async function POST(req: NextRequest) {
       }, { status: 400 })
     }
 
-    // Generate placeholder sha256 to satisfy unique constraint.
-    // Worker computes the real SHA-256 and detects duplicates.
-    const tempSha = crypto.randomBytes(32).toString('hex') + '-temp'
-
+    // sha256Hash starts null; the worker computes the real hash once it downloads
+    // the file and reports it back via /api/jobs/update.
     const fileRecord = await prisma.file.create({
-      data: {
-        s3Key,
-        sha256Hash: tempSha,
-      }
+      data: { s3Key }
     })
 
     const submission = await prisma.submission.create({
@@ -96,7 +103,7 @@ export async function POST(req: NextRequest) {
     })
 
     // Asynchronously dispatch job to the Python worker without blocking HTTP response
-    fetch('http://localhost:8000/jobs/process', {
+    fetch(`${WORKER_URL}/jobs/process`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -113,10 +120,6 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, submissionId: submission.id, jobId: job.id })
   } catch (error) {
-    console.error("Upload finalize error:", error)
-    return NextResponse.json({ 
-      error: 'Internal server error during finalization', 
-      details: error instanceof Error ? error.message : String(error) 
-    }, { status: 500 })
+    return apiError('Upload finalize error:', error, 'Failed to finalize upload. Please try again.')
   }
 }

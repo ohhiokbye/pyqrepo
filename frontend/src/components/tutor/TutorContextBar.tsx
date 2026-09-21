@@ -17,7 +17,6 @@ type Props = {
   onContextChange: (newContext: Partial<StudyContext>) => void
   onOpenKeyModal: () => void
   hasApiKey: boolean
-  provider: string
   groundedQuestionCount: number
 }
 
@@ -46,7 +45,6 @@ export function TutorContextBar({
   onContextChange,
   onOpenKeyModal,
   hasApiKey,
-  provider,
   groundedQuestionCount,
 }: Props) {
   // Filter courses by Program
@@ -220,10 +218,10 @@ export function TutorContextBar({
             onClick={onOpenKeyModal}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium border border-border rounded-md
                        bg-background text-foreground hover:bg-muted transition-colors"
-            title="Configure personal Gemini or OpenAI key"
+            title="Configure your personal Gemini key"
           >
             <span className={`w-1.5 h-1.5 rounded-full ${hasApiKey ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-            <span>{provider === 'openai' ? 'OpenAI' : 'Gemini 3.6'}</span>
+            <span>Gemini 3.6</span>
             <span className="text-muted-foreground font-mono">
               {hasApiKey ? 'Custom Key' : 'System Default'}
             </span>

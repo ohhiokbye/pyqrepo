@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import fs from 'fs'
 import path from 'path'
+import { verifyUploadToken } from '@/lib/storage/uploadToken'
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024 // 50MB maximum payload
 const ALLOWED_EXTENSIONS = new Set(['.pdf', '.pptx', '.png', '.jpg', '.jpeg'])
@@ -13,9 +14,16 @@ export async function PUT(req: NextRequest) {
 
   const searchParams = req.nextUrl.searchParams
   const s3Key = searchParams.get('key')
-  
+  const token = searchParams.get('token')
+
   if (!s3Key) {
     return NextResponse.json({ error: 'Missing key parameter' }, { status: 400 })
+  }
+
+  // The token is only issued by /api/upload/init (which is passphrase-gated),
+  // so this endpoint can't be used to write arbitrary files on its own.
+  if (!verifyUploadToken(s3Key, token)) {
+    return NextResponse.json({ error: 'Unauthorized or expired upload token' }, { status: 401 })
   }
 
   // Enforce base directory boundary and path traversal protection

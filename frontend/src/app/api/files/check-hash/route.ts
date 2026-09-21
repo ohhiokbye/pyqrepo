@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { apiError } from '@/lib/apiError'
+import { getQuestionEmbeddings } from '@/lib/embeddings'
 
 export async function GET(req: NextRequest) {
   const hash = req.nextUrl.searchParams.get('hash')
@@ -44,6 +46,11 @@ export async function GET(req: NextRequest) {
     if (existingFile && existingFile.papers.length > 0) {
       const paper = existingFile.papers[0]
       if (paper.questions.length > 0) {
+        // Embeddings live in a pgvector "Unsupported" column Prisma can't select
+        // normally - fetched separately via raw SQL so a reused duplicate paper
+        // keeps its questions semantically searchable too, not just the original.
+        const embeddings = await getQuestionEmbeddings(paper.questions.map((q) => q.id))
+
         return NextResponse.json({
           exists: true,
           existingFileId: existingFile.id,
@@ -56,6 +63,7 @@ export async function GET(req: NextRequest) {
             imageCropS3Key: q.imageCropS3Key,
             topic: q.questionTopics[0]?.topic?.topicName || 'General',
             confidence: q.questionTopics[0]?.confidence || 0.85,
+            embedding: embeddings[q.id] ?? null,
           })),
         })
       }
@@ -63,13 +71,6 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json({ exists: false })
   } catch (error) {
-    console.error('Check-hash error:', error)
-    return NextResponse.json(
-      {
-        error: 'Failed to verify file hash',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 }
-    )
+    return apiError('Check-hash error:', error, 'Failed to verify file hash.')
   }
 }

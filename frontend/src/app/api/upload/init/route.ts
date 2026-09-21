@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { storage } from '@/lib/storage'
 import { z } from 'zod'
+import { checkRateLimit, getClientIdentifier } from '@/lib/rateLimit'
+
+// The upload passphrase is a single shared secret with no lockout, so guard
+// against brute-force guessing with a per-IP attempt limit.
+const PASSPHRASE_ATTEMPT_LIMIT = 10
+const PASSPHRASE_ATTEMPT_WINDOW_MS = 15 * 60 * 1000 // 15 minutes
 
 const uploadInitSchema = z.object({
   fileName: z.string().min(1),
@@ -17,6 +23,10 @@ const MAX_PYQ_SIZE = 25 * 1024 * 1024 // 25MB
 const MAX_STUDY_SIZE = 50 * 1024 * 1024 // 50MB
 
 export async function POST(req: NextRequest) {
+  if (!checkRateLimit(`upload-init:${getClientIdentifier(req)}`, PASSPHRASE_ATTEMPT_LIMIT, PASSPHRASE_ATTEMPT_WINDOW_MS)) {
+    return NextResponse.json({ error: 'Too many attempts. Please try again later.' }, { status: 429 })
+  }
+
   // Authorization
   const authHeader = req.headers.get('authorization')
   const expectedPassphrase = process.env.UPLOAD_PASSPHRASE

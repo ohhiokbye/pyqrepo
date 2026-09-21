@@ -52,6 +52,7 @@ export default function UploadPage() {
   }
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetching from the network on mount, not deriving state from props
     loadCourses()
     // Load previously remembered passphrase if available
     try {

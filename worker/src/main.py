@@ -18,6 +18,9 @@ from src.pipeline.processor import DocumentProcessor
 
 processor = DocumentProcessor()
 
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+WORKER_INTERNAL_KEY = os.environ.get('WORKER_INTERNAL_KEY', '')
+
 class ProcessJobRequest(BaseModel):
     jobId: str
     s3Key: str
@@ -25,8 +28,27 @@ class ProcessJobRequest(BaseModel):
     courseCode: Optional[str] = "BMAT202L"
     year: Optional[int] = None
 
-# Track jobs currently being processed to prevent double-processing
+# In-process fast-path guard to avoid redundant claim calls; NOT the source of
+# truth for correctness (a worker restart clears this). The real guard against
+# double-processing across restarts or multiple worker instances is the atomic
+# DB-level claim below.
 active_jobs: set[str] = set()
+
+async def claim_job(job_id: str) -> bool:
+    """Atomically flips a job from PENDING to PROCESSING via the frontend API.
+    Returns True only if this call won the claim."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.post(
+                f"{FRONTEND_URL}/api/jobs/claim",
+                json={"jobId": job_id},
+                headers={"x-internal-worker-key": WORKER_INTERNAL_KEY},
+            )
+            if res.status_code == 200:
+                return bool(res.json().get("claimed"))
+    except Exception as e:
+        print(f"[Worker] Could not claim job {job_id}: {e}")
+    return False
 
 async def autonomous_job_poller():
     """
@@ -40,7 +62,7 @@ async def autonomous_job_poller():
     while True:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get("http://localhost:3000/api/submissions")
+                res = await client.get(f"{FRONTEND_URL}/api/submissions")
                 if res.status_code == 200:
                     data = res.json()
                     submissions = data.get("submissions", [])
@@ -50,6 +72,8 @@ async def autonomous_job_poller():
                         for job in jobs:
                             job_id = job.get("id")
                             if job.get("status") == "PENDING" and job_id not in active_jobs:
+                                if not await claim_job(job_id):
+                                    continue  # lost the claim race, or frontend unreachable; retry next cycle
                                 active_jobs.add(job_id)
                                 s3_key = file_info.get("s3Key")
                                 
@@ -109,13 +133,21 @@ def health_check():
 async def process_job(request: ProcessJobRequest, background_tasks: BackgroundTasks):
     """
     Direct dispatch endpoint called by Next.js finalize route.
-    Guards against double-processing with the shared active_jobs set.
+    Atomically claims the job in the DB (PENDING -> PROCESSING) so a concurrent
+    poller pass, worker restart, or duplicate dispatch can't double-process it.
     """
     if request.jobId in active_jobs:
         return {
             "status": "ALREADY_PROCESSING",
             "jobId": request.jobId,
             "message": "Job is already being processed."
+        }
+
+    if not await claim_job(request.jobId):
+        return {
+            "status": "CLAIM_FAILED",
+            "jobId": request.jobId,
+            "message": "Job was already claimed, or the claim could not be confirmed; the autonomous poller will retry it."
         }
 
     active_jobs.add(request.jobId)

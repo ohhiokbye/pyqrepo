@@ -10,8 +10,8 @@ build/
 dist/
 
 # Python Virtual Environment & Cache
-worker/venv/
-venv/
+worker/venv*/
+venv*/
 ENV/
 __pycache__/
 *.py[cod]

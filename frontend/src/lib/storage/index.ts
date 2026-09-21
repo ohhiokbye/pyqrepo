@@ -1,6 +1,7 @@
 import fs from 'fs'
 import path from 'path'
 import { v4 as uuidv4 } from 'uuid'
+import { signUploadKey } from './uploadToken'
 
 export interface StorageProvider {
   /**
@@ -22,9 +23,12 @@ export class LocalFileSystemProvider implements StorageProvider {
   async generateUploadUrl(fileName: string, mimeType: string, maxSizeInBytes: number): Promise<{ url: string; s3Key: string }> {
     const cleanFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_')
     const s3Key = `uploads/submissions/${uuidv4()}-${cleanFileName}`
-    // In local dev, we return an endpoint in our own Next.js app that will handle the file write
-    const url = `http://localhost:3000/api/local-upload?key=${encodeURIComponent(s3Key)}`
-    
+    // In local dev, we return an endpoint in our own Next.js app that will handle the file write.
+    // A short-lived signed token binds the PUT to this exact key so the write
+    // endpoint can't be used directly without going through this (passphrase-gated) init step.
+    const token = signUploadKey(s3Key)
+    const url = `http://localhost:3000/api/local-upload?key=${encodeURIComponent(s3Key)}&token=${encodeURIComponent(token)}`
+
     return { url, s3Key }
   }
 }

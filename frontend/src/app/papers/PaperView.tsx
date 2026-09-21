@@ -1,6 +1,4 @@
 import type { ExamPaper } from '@/lib/data/papers'
-import { CropPreview } from '@/app/questions/CropPreview'
-import { ExpandableText } from '@/app/questions/ExpandableText'
 
 type Props = {
   papers: ExamPaper[]
@@ -21,113 +19,54 @@ export function PaperView({ papers }: Props) {
   }
 
   return (
-    <div className="space-y-10">
-      {papers.map((paper, paperIdx) => (
-        <article
-          key={paper.id}
-          className="border border-border rounded-2xl bg-surface/40 overflow-hidden shadow-sm"
-        >
-          {/* Official University Exam Header Sheet */}
-          <div className="border-b border-border bg-surface p-5 sm:p-6 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-border/60 pb-3">
-              <div>
-                <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground block">
-                  Official Examination Paper #{paperIdx + 1}
-                </span>
-                <h2 className="text-lg font-bold text-foreground tracking-tight mt-0.5">
-                  {paper.course.code} — {paper.course.title}
-                </h2>
+    <div className="border-t border-border">
+      {papers.map((paper) => {
+        const row = (
+          <>
+            <div className="min-w-0">
+              <div className="flex items-baseline gap-2 flex-wrap">
+                <span className="text-base font-bold text-foreground">{paper.course.code}</span>
+                <span className="text-xs text-muted-foreground truncate">{paper.course.title}</span>
               </div>
-              <div className="flex items-center gap-2">
-                <span className="px-2.5 py-1 bg-primary text-primary-foreground text-xs font-bold font-mono rounded-md">
-                  {paper.examType}
-                </span>
-                {paper.year && (
-                  <span className="px-2.5 py-1 bg-muted border border-border text-foreground text-xs font-mono font-medium rounded-md">
-                    {paper.year}
-                  </span>
-                )}
+              <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                <span>{paper.examType}{paper.year ? ` · ${paper.year}` : ''}</span>
+                <span>{paper.questionCount} question{paper.questionCount !== 1 ? 's' : ''}</span>
+                <span>{paper.totalMarks} marks</span>
               </div>
             </div>
+            {paper.pdfUrl ? (
+              <span className="shrink-0 text-xs font-medium text-foreground underline underline-offset-2">
+                View
+              </span>
+            ) : (
+              <span className="shrink-0 text-xs text-muted-foreground">Unavailable</span>
+            )}
+          </>
+        )
 
-            {/* Exam metadata grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-              <div className="p-2.5 bg-background border border-border rounded-lg">
-                <span className="text-[10px] text-muted-foreground uppercase font-semibold block">Exam Category</span>
-                <span className="font-semibold text-foreground mt-0.5 block">{paper.examType} Examination</span>
-              </div>
-              <div className="p-2.5 bg-background border border-border rounded-lg">
-                <span className="text-[10px] text-muted-foreground uppercase font-semibold block">Maximum Marks</span>
-                <span className="font-semibold text-foreground mt-0.5 block">{paper.totalMarks} Marks</span>
-              </div>
-              <div className="p-2.5 bg-background border border-border rounded-lg">
-                <span className="text-[10px] text-muted-foreground uppercase font-semibold block">Total Questions</span>
-                <span className="font-semibold text-foreground mt-0.5 block">{paper.questionCount} Questions</span>
-              </div>
-              <div className="p-2.5 bg-background border border-border rounded-lg">
-                <span className="text-[10px] text-muted-foreground uppercase font-semibold block">Academic Session</span>
-                <span className="font-semibold text-foreground mt-0.5 block">{paper.year ? `Academic Year ${paper.year}` : 'Winter Session'}</span>
-              </div>
+        if (!paper.pdfUrl) {
+          return (
+            <div
+              key={paper.id}
+              className="flex items-center justify-between gap-4 py-4 border-b border-border opacity-60"
+            >
+              {row}
             </div>
-          </div>
+          )
+        }
 
-          {/* Questions Stream */}
-          <div className="p-5 sm:p-6 space-y-6 divide-y divide-border/60">
-            {paper.questions.map((q, qIndex) => {
-              const cleanedText = cleanText(q.extractedText)
-
-              return (
-                <div
-                  key={q.id}
-                  className={`space-y-3 ${qIndex > 0 ? 'pt-6' : ''}`}
-                >
-                  {/* Question header row */}
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-bold font-mono text-foreground px-2 py-0.5 bg-muted rounded">
-                        {q.questionNumber}
-                      </span>
-                      {q.marks != null && (
-                        <span className="text-xs px-2 py-0.5 bg-muted border border-border rounded text-foreground font-semibold tabular-nums">
-                          {q.marks} marks
-                        </span>
-                      )}
-                    </div>
-
-                    {q.primaryTopic && (
-                      <span className="text-xs px-2 py-0.5 border border-border rounded-md text-muted-foreground bg-muted/30">
-                        {q.primaryTopic.name}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Problem Statement */}
-                  <ExpandableText text={cleanedText} />
-
-                  {/* Original High-Resolution Question Paper Crop */}
-                  {q.cropUrl && (
-                    <div className="pt-1">
-                      <CropPreview
-                        cropUrl={q.cropUrl}
-                        alt={`${paper.course.code} ${paper.examType} ${q.questionNumber}`}
-                      />
-                    </div>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-        </article>
-      ))}
+        return (
+          <a
+            key={paper.id}
+            href={paper.pdfUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-between gap-4 py-4 border-b border-border hover:bg-muted/40 transition-colors"
+          >
+            {row}
+          </a>
+        )
+      })}
     </div>
   )
-}
-
-function cleanText(text: string): string {
-  return text
-    .replace(/---\s*Question Paper Page \d+\s*---/g, '')
-    .replace(/---\s*Slide\/Page \d+\s*---/g, '')
-    .replace(/---\s*Page \d+\s*---/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
 }

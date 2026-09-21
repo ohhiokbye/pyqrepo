@@ -1,15 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { Prisma } from '@prisma/client'
+import { apiError } from '@/lib/apiError'
+import { setQuestionEmbedding } from '@/lib/embeddings'
+
+const PRISMA_UNIQUE_CONSTRAINT_VIOLATION = 'P2002'
 
 export async function POST(req: NextRequest) {
-  // Internal-only endpoint: validate worker key or passphrase
+  // Internal-only endpoint: the worker must present the shared internal key.
+  // Never trust client-controlled headers (e.g. Host) to decide trust.
   const authHeader = req.headers.get('x-internal-worker-key')
-  const expectedPassphrase = process.env.UPLOAD_PASSPHRASE
+  const expectedKey = process.env.WORKER_INTERNAL_KEY
 
-  // Allow calls from worker (no auth header) only from localhost, 
-  // or validate against passphrase if header is present
-  const isLocalRequest = req.headers.get('host')?.startsWith('localhost')
-  if (!isLocalRequest && authHeader !== expectedPassphrase) {
+  if (!expectedKey || authHeader !== expectedKey) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -62,64 +65,80 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 4. Update File.sha256Hash with actual computed hash
+    // 4. Update File.sha256Hash with the actual computed hash.
+    // sha256Hash is nullable+unique, so we rely on the DB constraint instead of a
+    // check-then-act race: if another file already claimed this hash concurrently,
+    // the update throws P2002 and we simply leave this file's hash unset.
     if (fileHash) {
       try {
-        const existingWithHash = await prisma.file.findFirst({
-          where: { sha256Hash: fileHash, id: { not: job.file.id } },
+        await prisma.file.update({
+          where: { id: job.file.id },
+          data: { sha256Hash: fileHash },
         })
-        if (!existingWithHash) {
-          await prisma.file.update({
-            where: { id: job.file.id },
-            data: { sha256Hash: fileHash },
-          })
-        }
       } catch (hashErr) {
-        console.warn('Could not update file sha256Hash:', hashErr)
+        if (hashErr instanceof Prisma.PrismaClientKnownRequestError && hashErr.code === PRISMA_UNIQUE_CONSTRAINT_VIOLATION) {
+          console.warn(`File ${job.file.id}: hash ${fileHash} already claimed by another file; leaving unset.`)
+        } else {
+          console.warn('Could not update file sha256Hash:', hashErr)
+        }
       }
     }
 
-    // 5. Persist atomic questions into PostgreSQL if paper exists
+    // 5. Persist atomic questions into PostgreSQL if paper exists.
+    // Each question is upserted on the (paperId, questionNumber) unique constraint,
+    // so retries or concurrent double-processing of the same job never create
+    // duplicate rows instead of relying on a racy "existingCount === 0" pre-check.
+    let questionsSaved = 0
     if (paper && Array.isArray(questions) && questions.length > 0) {
-      const existingCount = await prisma.question.count({
-        where: { paperId: paper.id },
-      })
+      for (const q of questions) {
+        const questionNumber = q.questionNumber || 'Q'
+        const createdQ = await prisma.question.upsert({
+          where: { paperId_questionNumber: { paperId: paper.id, questionNumber } },
+          update: {
+            extractedText: q.extractedText || '',
+            marks: q.marks ? Number(q.marks) : null,
+            imageCropS3Key: q.imageCropS3Key || null,
+          },
+          create: {
+            paperId: paper.id,
+            questionNumber,
+            extractedText: q.extractedText || '',
+            marks: q.marks ? Number(q.marks) : null,
+            imageCropS3Key: q.imageCropS3Key || null,
+          },
+        })
+        questionsSaved += 1
 
-      if (existingCount === 0) {
-        for (const q of questions) {
-          const createdQ = await prisma.question.create({
-            data: {
-              paperId: paper.id,
-              questionNumber: q.questionNumber || 'Q',
-              extractedText: q.extractedText || '',
-              marks: q.marks ? Number(q.marks) : null,
-              imageCropS3Key: q.imageCropS3Key || null,
+        // Semantic search vector from the worker (Gemini embedding API) - written via
+        // raw SQL since Prisma can't touch the pgvector "Unsupported" column directly.
+        if (q.embedding) {
+          await setQuestionEmbedding(createdQ.id, q.embedding)
+        }
+
+        // Link with topic if topic is classified and belongs to this course
+        if (q.topic && q.topic.toLowerCase().trim() !== 'general' && q.topic.toLowerCase().trim() !== 'none') {
+          const matchedTopic = await prisma.topic.findFirst({
+            where: {
+              module: {
+                courseId: paper.courseId,
+              },
+              topicName: {
+                contains: q.topic,
+                mode: 'insensitive',
+              },
             },
           })
 
-          // Link with topic if topic is classified and belongs to this course
-          if (q.topic && q.topic.toLowerCase().trim() !== 'general' && q.topic.toLowerCase().trim() !== 'none') {
-            const matchedTopic = await prisma.topic.findFirst({
-              where: {
-                module: {
-                  courseId: paper.courseId,
-                },
-                topicName: {
-                  contains: q.topic,
-                  mode: 'insensitive',
-                },
+          if (matchedTopic) {
+            await prisma.questionTopic.upsert({
+              where: { questionId_topicId: { questionId: createdQ.id, topicId: matchedTopic.id } },
+              update: { confidence: q.confidence ? Number(q.confidence) : 0.85 },
+              create: {
+                questionId: createdQ.id,
+                topicId: matchedTopic.id,
+                confidence: q.confidence ? Number(q.confidence) : 0.85,
               },
             })
-
-            if (matchedTopic) {
-              await prisma.questionTopic.create({
-                data: {
-                  questionId: createdQ.id,
-                  topicId: matchedTopic.id,
-                  confidence: q.confidence ? Number(q.confidence) : 0.85,
-                },
-              })
-            }
           }
         }
       }
@@ -130,16 +149,9 @@ export async function POST(req: NextRequest) {
       jobId,
       updatedStatus: status,
       submissionStatus,
-      questionsSaved: questions ? questions.length : 0,
+      questionsSaved,
     })
   } catch (error) {
-    console.error('Job update error:', error)
-    return NextResponse.json(
-      {
-        error: 'Failed to update job in database',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 }
-    )
+    return apiError('Job update error:', error, 'Failed to update job in database.')
   }
 }

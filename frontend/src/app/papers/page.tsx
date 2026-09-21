@@ -1,6 +1,7 @@
 import { getPapers, getPaperFilterMetadata } from '@/lib/data/papers'
 import { PaperFilters } from './PaperFilters'
 import { PaperView } from './PaperView'
+import { Pagination } from '@/components/Pagination'
 import type { Metadata } from 'next'
 
 export const metadata: Metadata = {
@@ -31,11 +32,14 @@ export default async function PapersPage({ searchParams }: Props) {
   const examType = getStringParam(params, 'examType') || ''
   const yearStr = getStringParam(params, 'year') || ''
   const year = yearStr ? parseInt(yearStr, 10) : undefined
+  const pageStr = getStringParam(params, 'page') || ''
+  const page = pageStr ? parseInt(pageStr, 10) : 1
 
-  const papers = await getPapers({
+  const { papers, total, totalPages } = await getPapers({
     courseCode,
     examType: examType || undefined,
     year,
+    page,
   })
 
   return (
@@ -61,6 +65,8 @@ export default async function PapersPage({ searchParams }: Props) {
 
       {/* Papers Stream */}
       <PaperView papers={papers} />
+
+      <Pagination page={page} totalPages={totalPages} total={total} itemLabel="paper" />
     </div>
   )
 }

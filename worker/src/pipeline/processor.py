@@ -6,12 +6,16 @@ import tempfile
 import pymupdf
 import httpx
 from typing import Dict, Any, List, Optional
+from pydantic import ValidationError
 from src.providers.storage import get_storage_provider
 from src.providers.ocr import get_ocr_provider
 from src.providers.llm import get_llm_provider
+from src.schemas import CoursesResponse, CheckHashResponse
 
 # Configurable confidence threshold from engineering specification
 CONFIDENCE_THRESHOLD = 0.80
+
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
 
 def _detect_year(text: str) -> Optional[int]:
     """Detect academic year from text headers, e.g. 'March 2025', '2024-25', 'Winter 2024', '2023'."""
@@ -47,15 +51,16 @@ class DocumentProcessor:
         """Fetch the real syllabus topics for a course from the database via API."""
         try:
             with httpx.Client(timeout=5.0) as client:
-                res = client.get("http://localhost:3000/api/courses")
+                res = client.get(f"{FRONTEND_URL}/api/courses")
                 if res.status_code == 200:
-                    data = res.json()
-                    for course in data.get("courses", []):
-                        if course.get("code") == course_code:
-                            topics = []
-                            for module in course.get("modules", []):
-                                for topic in module.get("topics", []):
-                                    topics.append(topic.get("topicName", ""))
+                    try:
+                        parsed = CoursesResponse.model_validate(res.json())
+                    except ValidationError as ve:
+                        print(f"[Pipeline] /api/courses response failed contract validation: {ve}")
+                        return []
+                    for course in parsed.courses:
+                        if course.code == course_code:
+                            topics = [t.topicName for m in course.modules for t in m.topics if t.topicName]
                             if topics:
                                 print(f"[Pipeline] Loaded {len(topics)} candidate topics for {course_code}.")
                                 return topics
@@ -67,9 +72,13 @@ class DocumentProcessor:
         """Check if an identical file has already been ingested into PostgreSQL."""
         try:
             with httpx.Client(timeout=5.0) as client:
-                res = client.get(f"http://localhost:3000/api/files/check-hash?hash={file_hash}&jobId={job_id}")
+                res = client.get(f"{FRONTEND_URL}/api/files/check-hash?hash={file_hash}&jobId={job_id}")
                 if res.status_code == 200:
-                    return res.json()
+                    try:
+                        return CheckHashResponse.model_validate(res.json()).model_dump()
+                    except ValidationError as ve:
+                        print(f"[Pipeline] /api/files/check-hash response failed contract validation: {ve}")
+                        return None
         except Exception as err:
             print(f"[Pipeline] Duplicate check notice ({err}). Proceeding with standard ingestion.")
         return None
@@ -308,6 +317,17 @@ class DocumentProcessor:
                 low_confidence_reasons.append(f"{q_num} topic confidence ({conf:.2f}) below threshold ({CONFIDENCE_THRESHOLD})")
 
         # ------------------------------------------------------------------
+        # Stage 4b: SEMANTIC EMBEDDING (for pgvector similarity search)
+        # 1 batched Gemini call for every question in this paper. A missing/failed
+        # embedding is not a review-routing concern - it just means that question
+        # isn't semantically searchable yet, so it never affects final_status below.
+        # ------------------------------------------------------------------
+        print("[Pipeline] Stage 4b: SEMANTIC_EMBEDDING")
+        embeddings = self.llm.embed_questions([q.get('extractedText', '') for q in questions])
+        for q, embedding in zip(questions, embeddings):
+            q['embedding'] = embedding
+
+        # ------------------------------------------------------------------
         # Stage 5: CONFIDENCE EVALUATION & REVIEW ROUTING
         # ------------------------------------------------------------------
         if low_confidence_reasons:
@@ -357,8 +377,9 @@ class DocumentProcessor:
 
             with httpx.Client(timeout=15.0) as client:
                 update_res = client.post(
-                    "http://localhost:3000/api/jobs/update",
-                    json=payload
+                    f"{FRONTEND_URL}/api/jobs/update",
+                    json=payload,
+                    headers={"x-internal-worker-key": os.environ.get("WORKER_INTERNAL_KEY", "")}
                 )
                 if update_res.status_code == 200:
                     print(f"[Pipeline] Successfully persisted status '{status}' and {len(questions)} questions in PostgreSQL.")

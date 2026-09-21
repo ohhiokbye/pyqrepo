@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
+import { apiError } from '@/lib/apiError'
 
 export async function GET() {
   try {
@@ -36,13 +37,6 @@ export async function GET() {
 
     return NextResponse.json({ submissions })
   } catch (error) {
-    console.error('Failed to fetch submissions:', error)
-    return NextResponse.json(
-      {
-        error: 'Failed to fetch submissions',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 }
-    )
+    return apiError('Failed to fetch submissions:', error, 'Failed to fetch submissions.')
   }
 }
