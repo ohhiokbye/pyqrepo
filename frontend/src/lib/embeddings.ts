@@ -13,6 +13,15 @@ import { Prisma } from '@prisma/client'
 const EMBEDDING_MODEL = 'gemini-embedding-001'
 const EMBEDDING_DIMENSIONS = 768
 
+// Questions farther than this (cosine distance) from the query are treated as
+// unrelated and never used as grounding. Measured on the ingested papers: related
+// queries matched at ~0.36-0.44, unrelated ones (other subjects) from ~0.48 up.
+const MAX_COSINE_DISTANCE = 0.45
+
+// In-memory LRU of query text -> embedding, used by embedQuery below.
+const QUERY_EMBEDDING_CACHE_SIZE = 500
+const queryEmbeddingCache = new Map<string, number[]>()
+
 // pgvector's wire format for a vector literal is a plain string like "[0.1,-0.2,0.3]",
 // cast to the column type with `::vector` in the SQL itself.
 function toVectorLiteral(embedding: number[]): string {
@@ -57,8 +66,21 @@ export async function getQuestionEmbeddings(questionIds: string[]): Promise<Reco
  * what makes the similarity comparison meaningful, not just dimension-compatible.
  * Returns null on any failure so callers can fall back to lexical search
  * instead of breaking the chat.
+ *
+ * Results are cached in memory by text (never by API key - the embedding of a
+ * text is the same whoever pays for it), so repeated questions skip the API call.
  */
 export async function embedQuery(text: string, apiKey: string): Promise<number[] | null> {
+  const input = text.slice(0, 8000) // guard against pathological input length
+
+  const cached = queryEmbeddingCache.get(input)
+  if (cached) {
+    // Re-insert so the Map's insertion order doubles as least-recently-used order
+    queryEmbeddingCache.delete(input)
+    queryEmbeddingCache.set(input, cached)
+    return cached
+  }
+
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`,
@@ -66,7 +88,7 @@ export async function embedQuery(text: string, apiKey: string): Promise<number[]
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          content: { parts: [{ text: text.slice(0, 8000) }] }, // guard against pathological input length
+          content: { parts: [{ text: input }] },
           taskType: 'RETRIEVAL_QUERY',
           outputDimensionality: EMBEDDING_DIMENSIONS,
         }),
@@ -74,7 +96,15 @@ export async function embedQuery(text: string, apiKey: string): Promise<number[]
     )
     if (!res.ok) return null
     const data = await res.json()
-    return data.embedding?.values ?? null
+    const embedding: number[] | null = data.embedding?.values ?? null
+    if (embedding) {
+      if (queryEmbeddingCache.size >= QUERY_EMBEDDING_CACHE_SIZE) {
+        // Evict the least recently used entry (first in insertion order)
+        queryEmbeddingCache.delete(queryEmbeddingCache.keys().next().value!)
+      }
+      queryEmbeddingCache.set(input, embedding)
+    }
+    return embedding
   } catch {
     return null
   }
@@ -113,6 +143,7 @@ export async function findSimilarQuestionIds(
     JOIN "Course" c ON p."courseId" = c.id
     WHERE c.code = ${courseCode}
       AND q.embedding IS NOT NULL
+      AND (q.embedding <=> ${literal}::vector) < ${MAX_COSINE_DISTANCE}
       ${topicFilter}
     ORDER BY distance ASC
     LIMIT ${limit}

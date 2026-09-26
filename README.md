@@ -116,6 +116,7 @@ cp ../.env.example .env
 
 # Push Prisma schema and seed initial university courses & syllabus trees
 npx prisma db push
+npx prisma db seed
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) in your browser.
@@ -146,6 +147,7 @@ Create a `.env` in the root (or frontend / worker directories) based on `.env.ex
 | `UPLOAD_PASSPHRASE` | Secret passphrase required to upload papers | `change-me` |
 | `WORKER_INTERNAL_KEY` | Shared secret for worker to report results to `/api/jobs/update` | Generate a 32-byte hex string |
 | `GEMINI_API_KEY` | Google Gemini API key for embeddings, segmentation & tutor | Required for Gemini features |
+| `LLM_FALLBACK_BASE_URL` / `LLM_FALLBACK_API_KEY` / `LLM_FALLBACK_MODEL` | Optional OpenAI-compatible backup for text generation when Gemini is out of quota or overloaded (embeddings stay on Gemini) | Groq: `https://api.groq.com/openai/v1` |
 | `LLM_PROVIDER` | LLM backend for worker (`gemini` or `mock`) | `gemini` |
 | `OCR_PROVIDER` | OCR engine (`tesseract` or `glm-ocr`) | `tesseract` |
 | `STORAGE_DRIVER` | Storage system for files and crops | `local` |

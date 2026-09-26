@@ -122,8 +122,10 @@ export async function POST(req: NextRequest) {
               module: {
                 courseId: paper.courseId,
               },
+              // Exact (case-insensitive) match: `contains` would link e.g.
+              // "Normalization" to a "Denormalization" topic.
               topicName: {
-                contains: q.topic,
+                equals: q.topic.trim(),
                 mode: 'insensitive',
               },
             },

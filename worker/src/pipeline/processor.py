@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import hashlib
 import tempfile
 import pymupdf
@@ -9,13 +10,28 @@ from typing import Dict, Any, List, Optional
 from pydantic import ValidationError
 from src.providers.storage import get_storage_provider
 from src.providers.ocr import get_ocr_provider
-from src.providers.llm import get_llm_provider
+from src.providers.llm import get_llm_provider, _regex_segment_questions
 from src.schemas import CoursesResponse, CheckHashResponse
 
 # Configurable confidence threshold from engineering specification
 CONFIDENCE_THRESHOLD = 0.80
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+COURSES_CACHE_TTL = 10 * 60  # seconds
+
+# Share of the OCR text (ignoring whitespace) that segmented questions must cover.
+# Complete segmentations measured 0.70-0.83 (the paper header is legitimately left
+# out); segmentations missing half their questions measured 0.17-0.46.
+MIN_SEGMENTATION_COVERAGE = 0.55
+
+
+def _segmentation_coverage(extracted_text: str, questions: List[Dict]) -> float:
+    """Fraction of the extracted text's characters that ended up inside some question."""
+    body = re.sub(r'--- (?:Question Paper Page|Slide/Page|Page) \d+ ---', '', extracted_text)
+    body_chars = len(''.join(body.split()))
+    question_chars = sum(len(''.join(q.get('extractedText', '').split())) for q in questions)
+    return question_chars / body_chars if body_chars else 1.0
 
 def _detect_year(text: str) -> Optional[int]:
     """Detect academic year from text headers, e.g. 'March 2025', '2024-25', 'Winter 2024', '2023'."""
@@ -46,24 +62,36 @@ class DocumentProcessor:
         self.storage = get_storage_provider()
         self.ocr = get_ocr_provider()
         self.llm = get_llm_provider()
+        # (fetched_at, courses) - the syllabus rarely changes, so jobs share one fetch
+        self._courses_cache: Optional[tuple[float, CoursesResponse]] = None
+
+    def _get_courses(self) -> Optional[CoursesResponse]:
+        """Fetch all courses via the API, reusing the last response for COURSES_CACHE_TTL seconds."""
+        if self._courses_cache and time.time() - self._courses_cache[0] < COURSES_CACHE_TTL:
+            return self._courses_cache[1]
+
+        with httpx.Client(timeout=5.0) as client:
+            res = client.get(f"{FRONTEND_URL}/api/courses")
+        if res.status_code != 200:
+            return None
+        try:
+            parsed = CoursesResponse.model_validate(res.json())
+        except ValidationError as ve:
+            print(f"[Pipeline] /api/courses response failed contract validation: {ve}")
+            return None
+        self._courses_cache = (time.time(), parsed)
+        return parsed
 
     def _fetch_course_topics(self, course_code: str) -> List[str]:
         """Fetch the real syllabus topics for a course from the database via API."""
         try:
-            with httpx.Client(timeout=5.0) as client:
-                res = client.get(f"{FRONTEND_URL}/api/courses")
-                if res.status_code == 200:
-                    try:
-                        parsed = CoursesResponse.model_validate(res.json())
-                    except ValidationError as ve:
-                        print(f"[Pipeline] /api/courses response failed contract validation: {ve}")
-                        return []
-                    for course in parsed.courses:
-                        if course.code == course_code:
-                            topics = [t.topicName for m in course.modules for t in m.topics if t.topicName]
-                            if topics:
-                                print(f"[Pipeline] Loaded {len(topics)} candidate topics for {course_code}.")
-                                return topics
+            parsed = self._get_courses()
+            for course in (parsed.courses if parsed else []):
+                if course.code == course_code:
+                    topics = [t.topicName for m in course.modules for t in m.topics if t.topicName]
+                    if topics:
+                        print(f"[Pipeline] Loaded {len(topics)} candidate topics for {course_code}.")
+                        return topics
         except Exception as e:
             print(f"[Pipeline] Could not fetch course topics: {e}")
         return []
@@ -186,6 +214,16 @@ class DocumentProcessor:
         if ocr_confidence < CONFIDENCE_THRESHOLD:
             low_confidence_reasons.append(f"OCR mean confidence ({ocr_confidence:.2f}) below threshold ({CONFIDENCE_THRESHOLD})")
 
+        # The regex fallback (used when the LLM is unavailable) can't see question numbers
+        # that OCR dropped - common when they sit in a table column - so it may merge many
+        # questions into one. Its output always needs a human check.
+        if questions == _regex_segment_questions(extracted_text):
+            low_confidence_reasons.append("Questions were split by the regex fallback (LLM unavailable); numbering may be incomplete")
+
+        coverage = _segmentation_coverage(extracted_text, questions)
+        if coverage < MIN_SEGMENTATION_COVERAGE:
+            low_confidence_reasons.append(f"Questions cover only {coverage:.0%} of the extracted text; some questions may be missing")
+
         # Fetch real syllabus topics for this course
         candidate_topics = self._fetch_course_topics(course_code)
 
@@ -305,9 +343,13 @@ class DocumentProcessor:
         for br in batch_results:
             batch_lookup[br.get('questionNumber', '')] = br
 
-        for q in questions:
+        # Results are returned in question order, so if the model rewrote a label
+        # (e.g. "Q1(a)" -> "Q1a") fall back to matching by position.
+        results_in_order = len(batch_results) == len(questions)
+
+        for i, q in enumerate(questions):
             q_num = q.get('questionNumber', 'Q')
-            match = batch_lookup.get(q_num, {})
+            match = batch_lookup.get(q_num) or (batch_results[i] if results_in_order else {})
             topic = match.get('topicName', 'General')
             conf = float(match.get('confidence', 0.85))
             q['topic'] = topic

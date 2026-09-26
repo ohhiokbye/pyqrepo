@@ -4,6 +4,7 @@ import { toQuestionResult } from '@/lib/data/toQuestionResult'
 import { apiError } from '@/lib/apiError'
 import { checkRateLimit, getClientIdentifier } from '@/lib/rateLimit'
 import { embedQuery, findSimilarQuestionIds } from '@/lib/embeddings'
+import { getCourseWithSyllabus } from '@/lib/data/courses'
 
 const questionInclude = {
   paper: { include: { course: true } },
@@ -94,6 +95,48 @@ type ChatRequestBody = {
   apiKey?: string
 }
 
+function isFallbackLlmConfigured(): boolean {
+  return Boolean(process.env.LLM_FALLBACK_BASE_URL?.trim() && process.env.LLM_FALLBACK_API_KEY?.trim())
+}
+
+/**
+ * Backup tutor reply when every Gemini model is unavailable (quota, overload),
+ * via any OpenAI-compatible chat API - configured for Groq, see .env.example.
+ * Returns '' on failure so the caller's static fallback reply still applies.
+ */
+async function callFallbackLlm(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  try {
+    const baseUrl = process.env.LLM_FALLBACK_BASE_URL!.trim().replace(/\/+$/, '')
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.LLM_FALLBACK_API_KEY!.trim()}`,
+      },
+      body: JSON.stringify({
+        model: process.env.LLM_FALLBACK_MODEL?.trim(),
+        // Roles come from the client unvalidated - anything but 'assistant' is sent as 'user',
+        // so a crafted message can never pose as a system instruction.
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...messages.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+        ],
+        temperature: 0.3,
+        max_tokens: 2048,
+      }),
+    })
+    if (!res.ok) {
+      console.warn(`[Tutor] Fallback LLM returned status ${res.status}: ${(await res.text()).slice(0, 150)}`)
+      return ''
+    }
+    const data = await res.json()
+    return data.choices?.[0]?.message?.content ?? ''
+  } catch (err) {
+    console.warn('[Tutor] Fallback LLM request failed:', err instanceof Error ? err.message : String(err))
+    return ''
+  }
+}
+
 // Anonymous requests that fall back to the server's own Gemini key are rate
 // limited per-IP so this route can't be used as a free, unmetered LLM proxy.
 // Requests carrying the caller's own key are exempt since they bear their own cost.
@@ -139,16 +182,8 @@ export async function POST(req: NextRequest) {
       }, { status: 429 })
     }
 
-    // 2. Fetch Course & Syllabus Hierarchy from Database
-    const course = await prisma.course.findUnique({
-      where: { code: context.courseCode },
-      include: {
-        modules: {
-          include: { topics: true },
-          orderBy: { moduleNo: 'asc' },
-        },
-      },
-    })
+    // 2. Fetch Course & Syllabus Hierarchy (cached in memory, see lib/data/courses.ts)
+    const course = await getCourseWithSyllabus(context.courseCode)
 
     if (!course) {
       return NextResponse.json({ error: `Course ${context.courseCode} not found` }, { status: 404 })
@@ -156,8 +191,14 @@ export async function POST(req: NextRequest) {
 
     // 3. Fetch Grounding Questions for this Course & Topic (semantic-first, see
     // fetchGroundingQuestions above for the retrieval strategy)
-    const latestMessageText = messages[messages.length - 1]?.content ?? ''
-    const allGroundingQuestions = await fetchGroundingQuestions(context.courseCode, context.topicName?.trim(), latestMessageText, apiKey)
+    // Search on the last few student turns, not just the latest, so follow-ups like
+    // "explain the second part" still retrieve questions on the topic being discussed.
+    const recentStudentText = messages
+      .filter((m) => m.role === 'user')
+      .slice(-3)
+      .map((m) => m.content)
+      .join('\n')
+    const allGroundingQuestions = await fetchGroundingQuestions(context.courseCode, context.topicName?.trim(), recentStudentText, apiKey)
 
     const formattedQuestions = allGroundingQuestions.map((q) => toQuestionResult(q, q.paper))
 
@@ -225,7 +266,7 @@ Core Pedagogical Guidelines:
     }
 
     // 5. Call LLM with multi-model fallback and retry on transient 503 / 429
-    const candidateModels = ['gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5-flash-lite']
+    const candidateModels = ['gemini-3.6-flash', 'gemini-flash-latest']
     let replyText = ''
     let lastError = ''
 
@@ -260,6 +301,14 @@ Core Pedagogical Guidelines:
         }
       }
       if (replyText) break
+    }
+
+    if (!replyText && isFallbackLlmConfigured()) {
+      console.warn('[Tutor] Gemini unavailable, trying fallback LLM:', lastError)
+      // The fallback runs on the server's key, so callers who brought their own Gemini
+      // key (exempt from the limit above) are rate limited before using it.
+      const allowed = usingServerKey || checkRateLimit(`tutor-chat:${getClientIdentifier(req)}`, SERVER_KEY_RATE_LIMIT_MAX, SERVER_KEY_RATE_LIMIT_WINDOW_MS)
+      if (allowed) replyText = await callFallbackLlm(systemPrompt, messages)
     }
 
     if (!replyText) {

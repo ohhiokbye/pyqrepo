@@ -8,6 +8,33 @@ from PIL import Image, ImageOps, ImageEnhance
 Image.MAX_IMAGE_PIXELS = None
 
 
+def _is_digital_page(page) -> bool:
+    """
+    True if the page has a real text layer rather than being a scanned image.
+    Scanner apps often add their own invisible OCR text over the page image, which
+    is usually worse than Tesseract - so a page counts as scanned whenever a single
+    image covers most of it, even if it has text.
+    """
+    if len(''.join(page.get_text().split())) < 100:
+        return False
+    page_area = page.rect.width * page.rect.height
+    for img in page.get_image_info():
+        bbox = pymupdf.Rect(img['bbox'])
+        if page_area > 0 and bbox.width * bbox.height > 0.5 * page_area:
+            return False
+    return True
+
+
+def _text_from_ocr_data(ocr_data: dict) -> str:
+    """Rebuild page text from pytesseract.image_to_data output, one line per OCR'd line."""
+    lines: dict = {}
+    for i, word in enumerate(ocr_data['text']):
+        if word.strip():
+            line_key = (ocr_data['block_num'][i], ocr_data['par_num'][i], ocr_data['line_num'][i])
+            lines.setdefault(line_key, []).append(word)
+    return '\n'.join(' '.join(words) for words in lines.values())
+
+
 class OCRProvider(ABC):
     @abstractmethod
     def extract_paper_text(self, file_path: str) -> Tuple[str, float]:
@@ -38,6 +65,13 @@ class DocumentExtractor(OCRProvider):
 
             for page_index in range(len(doc)):
                 page = doc[page_index]
+
+                # Digitally generated pages already carry exact text; OCR would only add errors.
+                if _is_digital_page(page):
+                    combined_text += f"\n--- Question Paper Page {page_index + 1} ---\n" + page.get_text()
+                    page_confidences.append(0.98)
+                    continue
+
                 rect = page.rect
                 area = rect.width * rect.height
                 
@@ -62,12 +96,13 @@ class DocumentExtractor(OCRProvider):
                         preprocessed = ImageEnhance.Contrast(enhanced).enhance(1.4)
                         preprocessed.save(img_path)
 
+                    # One OCR pass: image_to_data gives both the words and their confidences
                     with Image.open(img_path) as img:
                         ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
                         confs = [int(c) for c in ocr_data['conf'] if int(c) >= 0]
                         if confs:
                             page_conf = sum(confs) / (len(confs) * 100.0)
-                        page_text = pytesseract.image_to_string(img)
+                        page_text = _text_from_ocr_data(ocr_data)
                 except Exception as ocr_err:
                     print(f"[Paper OCR] Local Tesseract OCR invocation note on page {page_index + 1}: {ocr_err}")
                     native = page.get_text()

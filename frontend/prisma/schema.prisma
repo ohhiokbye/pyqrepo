@@ -1,10 +1,14 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  // pgvector must be enabled before Question.embedding can be created;
+  // `prisma db push` runs CREATE EXTENSION IF NOT EXISTS for this.
+  extensions = [vector]
 }
 
 model Course {
@@ -83,8 +87,8 @@ model Question {
   // pgvector column (gemini-embedding-001, 768 dims) used for semantic retrieval:
   // lets the tutor find questions that match a student's meaning, not just their
   // exact wording. Prisma can't read/write "Unsupported" columns directly - all
-  // access goes through $queryRaw/$executeRaw (see lib/embeddings.ts). Managed by
-  // hand via SQL (see migration in WALKTHROUGH.md / project.md), not `db push`.
+  // access goes through $queryRaw/$executeRaw (see lib/embeddings.ts). The vector
+  // type comes from the pgvector extension enabled in the datasource block above.
   embedding        Unsupported("vector(768)")?
 
   questionTopics   QuestionTopic[]
