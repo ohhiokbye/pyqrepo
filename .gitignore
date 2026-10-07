@@ -5,6 +5,7 @@ node_modules/
 
 # Next.js build output
 .next/
+.next-validation/
 out/
 build/
 dist/
@@ -24,6 +25,8 @@ local_storage/
 
 # Environment variables & secrets
 .env
+.env.*
+!.env.example
 .env.local
 .env.*.local
 
@@ -36,7 +39,11 @@ yarn-error.log*
 # System files
 .DS_Store
 *.pem
+.aws/
 
 #custom shi
 description.md
 proj.md
+.claude
+.codex
+.agents

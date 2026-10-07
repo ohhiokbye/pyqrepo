@@ -1,0 +1,9 @@
+{
+  "CORSRules": [{
+    "AllowedOrigins": ["https://YOUR-PRODUCTION-APP.vercel.app"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["content-type", "if-none-match"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 300
+  }]
+}

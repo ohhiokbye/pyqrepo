@@ -12,6 +12,7 @@ export async function getQuestions(filters: QuestionFilters): Promise<PaginatedQ
 
   const where = {
     paper: {
+      publicationStatus: 'AUTO_PUBLISHED',
       ...(filters.courseCode ? { course: { code: filters.courseCode } } : {}),
       ...(filters.examType ? { examType: filters.examType } : {}),
     },
@@ -85,6 +86,7 @@ export async function getCoursesWithTopics(): Promise<CourseWithModules[]> {
         orderBy: { moduleNo: 'asc' },
       },
       papers: {
+        where: { publicationStatus: 'AUTO_PUBLISHED' },
         select: {
           _count: {
             select: { questions: true },
@@ -103,7 +105,7 @@ export async function getCoursesWithTopics(): Promise<CourseWithModules[]> {
       title: c.title,
       credits: c.credits,
       questionCount,
-      modules: c.modules.map((m) => ({
+      modules: c.modules.filter((m) => m.syllabusVersionId === c.activeSyllabusVersionId).map((m) => ({
         id: m.id,
         moduleNo: m.moduleNo,
         name: m.name,
@@ -129,6 +131,7 @@ export async function getCoursesWithQuestions(): Promise<{ code: string; title: 
     where: {
       papers: {
         some: {
+          publicationStatus: 'AUTO_PUBLISHED',
           questions: {
             some: {},
           },
@@ -140,6 +143,7 @@ export async function getCoursesWithQuestions(): Promise<{ code: string; title: 
         select: {
           papers: {
             where: {
+              publicationStatus: 'AUTO_PUBLISHED',
               questions: { some: {} },
             },
           },
@@ -153,7 +157,7 @@ export async function getCoursesWithQuestions(): Promise<{ code: string; title: 
   const coursesWithCounts = await Promise.all(
     result.map(async (c) => {
       const count = await prisma.question.count({
-        where: { paper: { courseId: c.id } },
+        where: { paper: { courseId: c.id, publicationStatus: 'AUTO_PUBLISHED' } },
       })
       return { code: c.code, title: c.title, questionCount: count }
     })

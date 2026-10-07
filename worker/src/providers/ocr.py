@@ -1,272 +1,187 @@
+"""Provider-neutral OCR records. Polygons refer to the stored, corrected page image."""
 import os
-import pymupdf  # Modern PyMuPDF import
 from abc import ABC, abstractmethod
-from typing import Tuple, List, Optional
-
-from PIL import Image, ImageOps, ImageEnhance
-# Prevent Pillow DecompressionBombError on large scanned pages
-Image.MAX_IMAGE_PIXELS = None
+from typing import Tuple, List
+import pymupdf
+from PIL import Image, ImageOps
 
 
-def _is_digital_page(page) -> bool:
-    """
-    True if the page has a real text layer rather than being a scanned image.
-    Scanner apps often add their own invisible OCR text over the page image, which
-    is usually worse than Tesseract - so a page counts as scanned whenever a single
-    image covers most of it, even if it has text.
-    """
+def _is_digital_page(page):
     if len(''.join(page.get_text().split())) < 100:
         return False
-    page_area = page.rect.width * page.rect.height
-    for img in page.get_image_info():
-        bbox = pymupdf.Rect(img['bbox'])
-        if page_area > 0 and bbox.width * bbox.height > 0.5 * page_area:
-            return False
-    return True
+    area = page.rect.width * page.rect.height
+    return not any(pymupdf.Rect(item['bbox']).get_area() > area * .5 for item in page.get_image_info())
 
 
-def _text_from_ocr_data(ocr_data: dict) -> str:
-    """Rebuild page text from pytesseract.image_to_data output, one line per OCR'd line."""
-    lines: dict = {}
-    for i, word in enumerate(ocr_data['text']):
+def _text_from_ocr_data(data):
+    lines = {}
+    for i, word in enumerate(data['text']):
         if word.strip():
-            line_key = (ocr_data['block_num'][i], ocr_data['par_num'][i], ocr_data['line_num'][i])
-            lines.setdefault(line_key, []).append(word)
+            key = tuple(data[field][i] for field in ('block_num', 'par_num', 'line_num'))
+            lines.setdefault(key, []).append(word)
     return '\n'.join(' '.join(words) for words in lines.values())
 
 
 class OCRProvider(ABC):
-    @abstractmethod
-    def extract_paper_text(self, file_path: str) -> Tuple[str, float]:
-        """Extract text from scanned question papers via page rendering and OCR."""
-        pass
+    provider_name = 'unknown'
+
+    def __init__(self):
+        self._pages = []
 
     @abstractmethod
-    def extract_material_text(self, file_path: str) -> Tuple[str, float]:
-        """Extract text from digital notes/PPTs natively with OCR fallback."""
+    def extract_paper_text(self, file_path: str) -> Tuple[str, float]:
         pass
+
+    def extract_material_text(self, file_path: str) -> Tuple[str, float]:
+        # Mixed digital/scanned curricula use the same per-page fallback.
+        return self.extract_paper_text(file_path)
+
+    def page_layouts(self) -> List[List[dict]]:
+        return [page['lines'] for page in self._pages]
+
+    def page_records(self) -> List[dict]:
+        return [{key: value for key, value in page.items() if key != 'imagePath'} for page in self._pages]
+
+    def page_image(self, index):
+        return self._pages[index]['imagePath']
+
+    @staticmethod
+    def native_lines(page, scale):
+        lines = []
+        for block in page.get_text('dict')['blocks']:
+            for line in block.get('lines', []):
+                text = ''.join(span['text'] for span in line['spans']).strip()
+                if text:
+                    x0, y0, x1, y1 = [v * scale for v in line['bbox']]
+                    lines.append({'text': text, 'confidence': 1.0, 'polygon': [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]})
+        return lines
+
+    def recognise(self, image):
+        import pytesseract
+        data = pytesseract.image_to_data(ImageOps.autocontrast(ImageOps.grayscale(image)), output_type=pytesseract.Output.DICT)
+        groups = {}
+        for i, word in enumerate(data['text']):
+            if not word.strip() or float(data['conf'][i]) < 0:
+                continue
+            key = tuple(data[field][i] for field in ('block_num', 'par_num', 'line_num'))
+            groups.setdefault(key, []).append(i)
+        lines = []
+        for indices in groups.values():
+            x0 = min(data['left'][i] for i in indices)
+            y0 = min(data['top'][i] for i in indices)
+            x1 = max(data['left'][i] + data['width'][i] for i in indices)
+            y1 = max(data['top'][i] + data['height'][i] for i in indices)
+            lines.append({'text': ' '.join(data['text'][i] for i in indices), 'confidence': sum(float(data['conf'][i]) for i in indices)/len(indices)/100, 'polygon': [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]})
+        return image, lines, 'tesseract'
+
+    def extract_pages(self, file_path):
+        self._pages = []
+        with pymupdf.open(file_path) as doc:
+            if not 1 <= len(doc) <= int(os.environ.get('MAX_DOCUMENT_PAGES', '100')):
+                raise ValueError('Document page count exceeds worker limit')
+            for index, page in enumerate(doc):
+                area = page.rect.get_area()
+                scale = min(3., (12_000_000/max(area, 1)) ** .5)
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), colorspace=pymupdf.csRGB, alpha=False)
+                image = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
+                provider = 'native'
+                if _is_digital_page(page):
+                    lines = self.native_lines(page, scale)
+                else:
+                    try:
+                        image, lines, provider = self.recognise(image)
+                    except Exception as error:
+                        print(f'[OCR] Page {index + 1} failed ({type(error).__name__})')
+                        lines, provider = [], self.provider_name
+                image_path = f'{file_path}.page-{index}.png'
+                image.save(image_path)
+                confidence = sum(line['confidence'] for line in lines)/len(lines) if lines else 0.
+                self._pages.append({'pageIndex': index, 'width': image.width, 'height': image.height, 'coordinateSpace': 'corrected-image-pixels', 'provider': provider, 'confidence': confidence, 'lines': lines, 'imagePath': image_path})
+        text = '\n'.join(f"--- Question Paper Page {page['pageIndex'] + 1} ---\n" + '\n'.join(line['text'] for line in page['lines']) for page in self._pages if page['lines'])
+        confidence = sum(page['confidence'] for page in self._pages)/len(self._pages) if self._pages else 0.
+        return text, confidence
 
 
 class DocumentExtractor(OCRProvider):
-    def extract_paper_text(self, file_path: str) -> Tuple[str, float]:
-        """
-        Scanned Paper Pipeline:
-        1. Render each page using adaptive matrix scaling to prevent memory/decompression explosion.
-        2. Preprocess rendered page image (grayscale, autocontrast, sharpening).
-        3. Run OCR on preprocessed image and aggregate page results.
-        """
-        print(f"[Paper OCR] Processing scanned exam paper: {file_path}")
-        combined_text = ""
-        page_confidences: List[float] = []
-        temp_images: List[str] = []
+    provider_name = 'tesseract'
 
-        try:
-            doc = pymupdf.open(file_path)
-
-            for page_index in range(len(doc)):
-                page = doc[page_index]
-
-                # Digitally generated pages already carry exact text; OCR would only add errors.
-                if _is_digital_page(page):
-                    combined_text += f"\n--- Question Paper Page {page_index + 1} ---\n" + page.get_text()
-                    page_confidences.append(0.98)
-                    continue
-
-                rect = page.rect
-                area = rect.width * rect.height
-                
-                # Dynamic adaptive scale: target ~12 megapixels max, scale <= 3.0
-                scale = min(3.0, (12_000_000 / area) ** 0.5 if area > 0 else 2.0)
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
-                
-                img_path = f"{file_path}_page_{page_index + 1}.png"
-                pix.save(img_path)
-                temp_images.append(img_path)
-
-                page_text = ""
-                page_conf = 0.85
-
-                try:
-                    import pytesseract
-
-                    # Preprocess for contrast and legibility
-                    with Image.open(img_path) as raw_img:
-                        gray = ImageOps.grayscale(raw_img)
-                        enhanced = ImageOps.autocontrast(gray, cutoff=2)
-                        preprocessed = ImageEnhance.Contrast(enhanced).enhance(1.4)
-                        preprocessed.save(img_path)
-
-                    # One OCR pass: image_to_data gives both the words and their confidences
-                    with Image.open(img_path) as img:
-                        ocr_data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-                        confs = [int(c) for c in ocr_data['conf'] if int(c) >= 0]
-                        if confs:
-                            page_conf = sum(confs) / (len(confs) * 100.0)
-                        page_text = _text_from_ocr_data(ocr_data)
-                except Exception as ocr_err:
-                    print(f"[Paper OCR] Local Tesseract OCR invocation note on page {page_index + 1}: {ocr_err}")
-                    native = page.get_text()
-                    if native.strip():
-                        page_text = native
-                        page_conf = 0.88
-                    else:
-                        page_text = ""
-                        page_conf = 0.20
-
-                if page_text.strip():
-                    combined_text += f"\n--- Question Paper Page {page_index + 1} ---\n" + page_text
-                    page_confidences.append(page_conf)
-                else:
-                    print(f"[Paper OCR] Warning: Page {page_index + 1} produced no legible text.")
-                    page_confidences.append(0.20)
-
-            doc.close()
-
-            mean_confidence = sum(page_confidences) / len(page_confidences) if page_confidences else 0.50
-            print(f"[Paper OCR] Extraction finished. Total text chars: {len(combined_text)}, Mean Conf: {mean_confidence:.2f}")
-            return combined_text.strip(), mean_confidence
-
-        except Exception as e:
-            print(f"[Paper OCR] Critical error rendering/OCRing paper: {e}")
-            return "", 0.0
-        finally:
-            for p in temp_images:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-
-    def extract_material_text(self, file_path: str) -> Tuple[str, float]:
-        """
-        Study Material Pipeline:
-        1. Attempt clean deterministic native text extraction first via PyMuPDF.
-        2. Fallback to OCR only if text length is negligible (e.g. scanned slides).
-        """
-        print(f"[Material Extractor] Extracting study notes/material: {file_path}")
-        text = ""
-        try:
-            doc = pymupdf.open(file_path)
-            for page_index in range(len(doc)):
-                page_text = doc[page_index].get_text()
-                if page_text.strip():
-                    text += f"\n--- Slide/Page {page_index + 1} ---\n" + page_text
-            doc.close()
-
-            if len(text.strip()) > 50:
-                print(f"[Material Extractor] Extracted {len(text.strip())} chars natively via PyMuPDF.")
-                return text.strip(), 0.98
-
-        except Exception as e:
-            print(f"[Material Extractor] Native extraction error: {e}")
-
-        # Fallback to scanned paper OCR if material was image-based
-        print("[Material Extractor] Notes are image-based. Falling back to OCR...")
-        return self.extract_paper_text(file_path)
+    def extract_paper_text(self, file_path):
+        return self.extract_pages(file_path)
 
 
-class GLMOCRProvider(OCRProvider):
-    """
-    Multimodal Vision-Language OCR using Hugging Face's zai-org/GLM-OCR.
-    Capable of running locally on GPU with automatic fallback to DocumentExtractor.
-    """
-    def __init__(self, model_id: str = "zai-org/GLM-OCR"):
-        self.model_id = model_id
-        self._processor = None
-        self._model = None
-        self._fallback = DocumentExtractor()
+class PaddleOCRProvider(DocumentExtractor):
+    provider_name = 'paddleocr'
 
-    def _load_model(self) -> bool:
-        if self._model is not None:
-            return True
-        try:
-            import torch
-            from transformers import AutoProcessor, GlmOcrForConditionalGeneration
+    def __init__(self):
+        super().__init__()
+        self._ocr = None
+        self._unavailable = False
+        self._use_unwarping = True
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[GLM-OCR] Initializing {self.model_id} on {device.upper()} (CUDA: {torch.cuda.is_available()})...")
-            self._processor = AutoProcessor.from_pretrained(self.model_id)
-            self._model = GlmOcrForConditionalGeneration.from_pretrained(
-                self.model_id,
-                dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-                device_map="auto" if device == "cuda" else None
-            )
-            self._model.eval()
-            print(f"[GLM-OCR] Successfully loaded {self.model_id} on {device.upper()}!")
-            return True
-        except Exception as err:
-            print(f"[GLM-OCR] Note: Model initialization deferred/skipped ({err}). Using robust DocumentExtractor fallback.")
+    def table_fallback(self):
+        # Reuse the loaded model; orientation still runs, but preserve page edges
+        # when UVDoc warping removes a table's number/marks columns.
+        fallback = PaddleOCRProvider()
+        fallback._ocr = self._ocr
+        fallback._use_unwarping = False
+        return fallback
+
+    def _load(self):
+        if self._unavailable:
             return False
+        if self._ocr is None:
+            try:
+                os.environ.setdefault('FLAGS_allocator_strategy', 'auto_growth')
+                from paddleocr import PaddleOCR
+                self._ocr = PaddleOCR(lang='en', device=os.environ.get('OCR_DEVICE', 'gpu:0'), text_detection_model_name='PP-OCRv5_mobile_det', text_recognition_model_name='en_PP-OCRv5_mobile_rec', use_doc_orientation_classify=True, use_doc_unwarping=True, use_textline_orientation=True)
+            except Exception as error:
+                self._unavailable = True
+                print(f'[PaddleOCR] Runtime unavailable ({type(error).__name__}); falling back to Tesseract.')
+        return self._ocr is not None
 
-    def extract_paper_text(self, file_path: str) -> Tuple[str, float]:
-        if not self._load_model():
-            return self._fallback.extract_paper_text(file_path)
+    @staticmethod
+    def _normalise_result(result):
+        data = result.json if hasattr(result, 'json') else result
+        if callable(data):
+            data = data()
+        if isinstance(data, dict):
+            data = data.get('res', data)
+        lines = []
+        if isinstance(data, dict):
+            polys = data.get('rec_polys', [])
+            scores = data.get('rec_scores', [])
+            for i, text in enumerate(data.get('rec_texts', [])):
+                if str(text).strip():
+                    poly = polys[i].tolist() if hasattr(polys[i], 'tolist') else polys[i]
+                    lines.append({'text': str(text), 'confidence': float(scores[i]), 'polygon': poly})
+        elif isinstance(data, list):
+            for polygon, (text, score) in data:
+                lines.append({'text': str(text), 'confidence': float(score), 'polygon': polygon})
+        return '\n'.join(line['text'] for line in lines), sum(line['confidence'] for line in lines)/len(lines) if lines else 0., lines
 
-        print(f"[GLM-OCR] Transcribing exam paper via GPU: {file_path}")
-        combined_text = ""
-        temp_images: List[str] = []
+    def recognise(self, image):
+        if not self._load():
+            return super().recognise(image)
+        import numpy as np
         try:
-            import torch
-            from PIL import Image
-
-            doc = pymupdf.open(file_path)
-            for page_index in range(len(doc)):
-                page = doc[page_index]
-                rect = page.rect
-                area = rect.width * rect.height
-                scale = min(3.0, (12_000_000 / area) ** 0.5 if area > 0 else 2.0)
-                pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale))
-                img_path = f"{file_path}_glm_p{page_index + 1}.png"
-                pix.save(img_path)
-                temp_images.append(img_path)
-
-                with Image.open(img_path) as raw_img:
-                    rgb_img = raw_img.convert("RGB")
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": rgb_img},
-                                {"type": "text", "text": "Transcribe the examination paper into structured Markdown format, accurately outputting question numbers, subquestions, marks, formulas, and tables."}
-                            ]
-                        }
-                    ]
-                    inputs = self._processor.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt"
-                    ).to(self._model.device)
-
-                    with torch.no_grad():
-                        outputs = self._model.generate(**inputs, max_new_tokens=2048)
-                        page_text = self._processor.decode(outputs[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
-
-                if page_text.strip():
-                    combined_text += f"\n--- Question Paper Page {page_index + 1} ---\n" + page_text
-
-            doc.close()
-            return combined_text.strip(), 0.95
-        except Exception as e:
-            print(f"[GLM-OCR] Execution error ({e}). Delegating to DocumentExtractor fallback.")
-            return self._fallback.extract_paper_text(file_path)
-        finally:
-            for p in temp_images:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
-
-    def extract_material_text(self, file_path: str) -> Tuple[str, float]:
-        return self._fallback.extract_material_text(file_path)
+            result = next(iter(self._ocr.predict(np.asarray(image)[:, :, ::-1].copy(), use_doc_unwarping=self._use_unwarping)))
+            _, _, lines = self._normalise_result(result)
+            # Polygons are on the preprocessed image, not the original PDF render.
+            corrected = result['doc_preprocessor_res'].get('output_img')
+            if corrected is None:
+                raise ValueError('Missing corrected image; coordinate alignment cannot be verified')
+            return Image.fromarray(corrected[:, :, ::-1].astype('uint8')), lines, 'paddleocr' if self._use_unwarping else 'paddleocr-no-unwarp'
+        except Exception as error:
+            print(f'[PaddleOCR] Recognition failed ({type(error).__name__}); falling back to Tesseract.')
+            return super().recognise(image)
 
 
 TesseractOCRProvider = DocumentExtractor
 
-def get_ocr_provider() -> OCRProvider:
-    provider_name = os.environ.get('OCR_PROVIDER', 'tesseract').lower().strip()
-    if provider_name in ('glm-ocr', 'glm', 'huggingface'):
-        return GLMOCRProvider()
-    return DocumentExtractor()
+def get_ocr_provider():
+    provider = os.environ.get('OCR_PROVIDER', 'paddle').lower().strip()
+    if provider in ('paddle', 'paddleocr'):
+        return PaddleOCRProvider()
+    if provider == 'tesseract':
+        return DocumentExtractor()
+    raise ValueError(f'Unsupported OCR provider: {provider}')

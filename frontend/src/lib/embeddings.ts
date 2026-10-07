@@ -83,10 +83,11 @@ export async function embedQuery(text: string, apiKey: string): Promise<number[]
 
   try {
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        signal: AbortSignal.timeout(10_000),
         body: JSON.stringify({
           content: { parts: [{ text: input }] },
           taskType: 'RETRIEVAL_QUERY',
@@ -142,6 +143,8 @@ export async function findSimilarQuestionIds(
     JOIN "Paper" p ON q."paperId" = p.id
     JOIN "Course" c ON p."courseId" = c.id
     WHERE c.code = ${courseCode}
+      AND p."publicationStatus" = 'AUTO_PUBLISHED'
+      AND (q."embeddingModel" = ${EMBEDDING_MODEL} OR q."embeddingModel" IS NULL)
       AND q.embedding IS NOT NULL
       AND (q.embedding <=> ${literal}::vector) < ${MAX_COSINE_DISTANCE}
       ${topicFilter}

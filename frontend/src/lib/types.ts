@@ -1,5 +1,15 @@
 /** Shared domain types for the CPYQ frontend. */
 
+export type TutorSource = {
+  id: string; source: number; kind: 'notes' | 'question'; label: string; url: string;
+  text: string; heading: string; sourcePages: number[];
+  instructions: string | null; paperInstructions: string | null; marks: number | null;
+}
+export type RevisionEvidence = {
+  minutes: number; paperCount: number; status: 'available' | 'insufficient_data';
+  topics: { topicId: string; topic: string; module: string; matchingPapers: number; allocatedMarks: number }[];
+}
+
 export type ExamType = 'CAT1' | 'CAT2' | 'FAT'
 
 export type QuestionFilters = {

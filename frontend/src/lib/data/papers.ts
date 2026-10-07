@@ -47,7 +47,7 @@ function buildPdfUrl(s3Key: string | undefined): string | null {
 const paperInclude = {
   course: true,
   file: { select: { s3Key: true } },
-  questions: { select: { marks: true } },
+  questions: { select: { marks: true, marksScope: true } },
 }
 
 function formatPaper(p: {
@@ -56,7 +56,7 @@ function formatPaper(p: {
   year: number | null
   course: { id: string; code: string; title: string }
   file: { s3Key: string } | null
-  questions: { marks: number | null }[]
+  questions: { marks: number | null; marksScope: string }[]
 }): ExamPaper {
   return {
     id: p.id,
@@ -67,8 +67,8 @@ function formatPaper(p: {
       code: p.course.code,
       title: p.course.title,
     },
-    totalMarks: p.questions.reduce((acc, q) => acc + (q.marks ?? 0), 0),
-    questionCount: p.questions.length,
+    totalMarks: p.questions.reduce((acc, q) => acc + (q.marksScope === 'PARENT_TOTAL' ? 0 : q.marks ?? 0), 0),
+    questionCount: p.questions.filter((question) => question.marksScope !== 'PARENT_TOTAL').length,
     pdfUrl: buildPdfUrl(p.file?.s3Key),
   }
 }
@@ -82,6 +82,7 @@ export async function getPapers(filters: PaperFilters): Promise<PaginatedPapers>
     ...(filters.courseCode ? { course: { code: filters.courseCode } } : {}),
     ...(filters.examType ? { examType: filters.examType } : {}),
     ...(filters.year ? { year: filters.year } : {}),
+    publicationStatus: 'AUTO_PUBLISHED',
     questions: {
       some: {}, // only papers with segmented questions
     },
@@ -116,13 +117,14 @@ export async function getPaperFilterMetadata() {
       where: {
         papers: {
           some: {
+            publicationStatus: 'AUTO_PUBLISHED',
             questions: { some: {} },
           },
         },
       },
       include: {
         papers: {
-          where: { questions: { some: {} } },
+          where: { publicationStatus: 'AUTO_PUBLISHED', questions: { some: {} } },
           select: { id: true, examType: true, year: true },
         },
       },
@@ -130,6 +132,7 @@ export async function getPaperFilterMetadata() {
     }),
     prisma.paper.findMany({
       where: {
+        publicationStatus: 'AUTO_PUBLISHED',
         year: { not: null },
         questions: { some: {} },
       },

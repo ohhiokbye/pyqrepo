@@ -28,13 +28,22 @@ class CoursesResponse(BaseModel):
     courses: List[CourseInfo] = []
 
 
+class DuplicateTopic(BaseModel):
+    name: str
+    confidence: float
+
+
 class DuplicateQuestion(BaseModel):
     questionNumber: str = 'Q'
     marks: Optional[float] = None
     extractedText: str = ''
     imageCropS3Key: Optional[str] = None
+    pageIndex: Optional[int] = None
+    boundingBox: Optional[dict] = None
+    embeddingModel: Optional[str] = None
     topic: Optional[str] = None
     confidence: Optional[float] = None
+    topics: Optional[List[DuplicateTopic]] = None
     # Carried over from the original paper so a duplicate-detected reupload stays
     # semantically searchable too, not just the first copy (see lib/embeddings.ts).
     embedding: Optional[List[float]] = None

@@ -1,431 +1,131 @@
-import os
-import re
-import json
-import time
+"""Small outbound document pipeline using owner cloud keys and queue leases."""
 import hashlib
+import os
 import tempfile
-import pymupdf
+from pathlib import Path
+import pymupdf as fitz
 import httpx
-from typing import Dict, Any, List, Optional
-from pydantic import ValidationError
+from src.providers.cloud import CloudExtractor, EXTRACTION_VERSION, ProviderFailure
 from src.providers.storage import get_storage_provider
-from src.providers.ocr import get_ocr_provider
-from src.providers.llm import get_llm_provider, _regex_segment_questions
-from src.schemas import CoursesResponse, CheckHashResponse
+from src.pipeline.materials import MATERIAL_EXTRACTION_VERSION, extract_material_page
 
-# Configurable confidence threshold from engineering specification
-CONFIDENCE_THRESHOLD = 0.80
-
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-
-COURSES_CACHE_TTL = 10 * 60  # seconds
-
-# Share of the OCR text (ignoring whitespace) that segmented questions must cover.
-# Complete segmentations measured 0.70-0.83 (the paper header is legitimately left
-# out); segmentations missing half their questions measured 0.17-0.46.
-MIN_SEGMENTATION_COVERAGE = 0.55
-
-
-def _segmentation_coverage(extracted_text: str, questions: List[Dict]) -> float:
-    """Fraction of the extracted text's characters that ended up inside some question."""
-    body = re.sub(r'--- (?:Question Paper Page|Slide/Page|Page) \d+ ---', '', extracted_text)
-    body_chars = len(''.join(body.split()))
-    question_chars = sum(len(''.join(q.get('extractedText', '').split())) for q in questions)
-    return question_chars / body_chars if body_chars else 1.0
-
-def _detect_year(text: str) -> Optional[int]:
-    """Detect academic year from text headers, e.g. 'March 2025', '2024-25', 'Winter 2024', '2023'."""
-    # Academic year range e.g. 2024-25 or 2024-2025 -> pick later year
-    range_match = re.search(r'\b20(\d{2})[-/](?:20)?(\d{2})\b', text)
-    if range_match:
-        y2 = int(range_match.group(2))
-        return 2000 + y2 if y2 < 100 else y2
-
-    # Month / Term + Year e.g. "March 2025", "Winter 2024"
-    term_match = re.search(
-        r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|fall|winter|spring|summer)\s+[\'"]?(201\d|202\d)\b',
-        text,
-        re.IGNORECASE
-    )
-    if term_match:
-        return int(term_match.group(1))
-
-    # Standard 4-digit year (2015-2029)
-    year_match = re.search(r'\b(201[5-9]|202[0-9])\b', text)
-    if year_match:
-        return int(year_match.group(1))
-
-    return None
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000').rstrip('/')
 
 class DocumentProcessor:
     def __init__(self):
         self.storage = get_storage_provider()
-        self.ocr = get_ocr_provider()
-        self.llm = get_llm_provider()
-        # (fetched_at, courses) - the syllabus rarely changes, so jobs share one fetch
-        self._courses_cache: Optional[tuple[float, CoursesResponse]] = None
+        self.cloud = CloudExtractor()
 
-    def _get_courses(self) -> Optional[CoursesResponse]:
-        """Fetch all courses via the API, reusing the last response for COURSES_CACHE_TTL seconds."""
-        if self._courses_cache and time.time() - self._courses_cache[0] < COURSES_CACHE_TTL:
-            return self._courses_cache[1]
-
-        with httpx.Client(timeout=5.0) as client:
-            res = client.get(f"{FRONTEND_URL}/api/courses")
-        if res.status_code != 200:
-            return None
-        try:
-            parsed = CoursesResponse.model_validate(res.json())
-        except ValidationError as ve:
-            print(f"[Pipeline] /api/courses response failed contract validation: {ve}")
-            return None
-        self._courses_cache = (time.time(), parsed)
-        return parsed
-
-    def _fetch_course_topics(self, course_code: str) -> List[str]:
-        """Fetch the real syllabus topics for a course from the database via API."""
-        try:
-            parsed = self._get_courses()
-            for course in (parsed.courses if parsed else []):
-                if course.code == course_code:
-                    topics = [t.topicName for m in course.modules for t in m.topics if t.topicName]
-                    if topics:
-                        print(f"[Pipeline] Loaded {len(topics)} candidate topics for {course_code}.")
-                        return topics
-        except Exception as e:
-            print(f"[Pipeline] Could not fetch course topics: {e}")
-        return []
-
-    def _check_duplicate_hash(self, file_hash: str, job_id: str) -> Optional[Dict]:
-        """Check if an identical file has already been ingested into PostgreSQL."""
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                res = client.get(f"{FRONTEND_URL}/api/files/check-hash?hash={file_hash}&jobId={job_id}")
-                if res.status_code == 200:
-                    try:
-                        return CheckHashResponse.model_validate(res.json()).model_dump()
-                    except ValidationError as ve:
-                        print(f"[Pipeline] /api/files/check-hash response failed contract validation: {ve}")
-                        return None
-        except Exception as err:
-            print(f"[Pipeline] Duplicate check notice ({err}). Proceeding with standard ingestion.")
-        return None
-
-    def process_job(self, job_id: str, file_record: dict) -> dict:
-        """
-        Executes the staged pipeline:
-        validation -> extraction (scanned OCR for papers, native for materials)
-        -> question segmentation -> topic classification -> confidence evaluation -> review routing -> DB update
-        """
-        s3_key = file_record.get('s3Key', '')
-        document_type = file_record.get('documentType', 'PYQ')
-        course_code = file_record.get('courseCode', 'UNKNOWN')
-        year = file_record.get('year')
-
-        print(f"\n=======================================================")
-        print(f"[Pipeline] Processing Job {job_id}")
-        print(f"[Pipeline] Document Type: {document_type} | Course: {course_code} | File: {s3_key}")
-        print(f"=======================================================")
-
-        # Use tempfile for safe, unique temporary paths
-        tmp_dir = tempfile.mkdtemp(prefix=f"cpyq_{job_id[:8]}_")
-        local_path = os.path.join(tmp_dir, "document.pdf")
-
-        # ------------------------------------------------------------------
-        # Stage 1: DOWNLOAD & STORAGE VALIDATION
-        # ------------------------------------------------------------------
-        print("[Pipeline] Stage 1: DOWNLOADING & VALIDATION")
-        downloaded = self.storage.download_file(s3_key, local_path)
-        if not downloaded:
-            print(f"[Pipeline] Error: File {s3_key} could not be downloaded from storage.")
-            self._update_job_status(job_id, "FAILED", "DOWNLOADING", [], [])
-            return {
-                "success": False,
-                "status": "FAILED",
-                "stage": "DOWNLOADING",
-                "error": f"File '{s3_key}' not found in storage."
-            }
-
-        # SHA-256 Duplicate PDF Detection
-        file_hash = None
-        try:
-            with open(local_path, 'rb') as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()
-            print(f"[Pipeline] SHA-256: {file_hash}")
-        except Exception as hash_err:
-            print(f"[Pipeline] Hash computation error: {hash_err}")
-
-        if file_hash:
-            dupe_check = self._check_duplicate_hash(file_hash, job_id)
-            if dupe_check and dupe_check.get('exists'):
-                existing_questions = dupe_check.get('questions', [])
-                existing_year = dupe_check.get('year') or year
-                print(f"[Pipeline] Exact duplicate PDF detected (matches existing file {dupe_check.get('existingFileId')})!")
-                print(f"[Pipeline] Reusing {len(existing_questions)} pre-extracted questions. Zero GPU/LLM calls needed.")
-                self._update_job_status(job_id, "COMPLETED", "COMPLETED", [], existing_questions, year=existing_year, file_hash=file_hash)
-                try:
-                    import shutil
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-                return {
-                    "success": True,
-                    "jobId": job_id,
-                    "documentType": document_type,
-                    "status": "COMPLETED",
-                    "duplicate": True,
-                    "existingFileId": dupe_check.get('existingFileId'),
-                    "questions": existing_questions,
-                    "questionsCount": len(existing_questions)
-                }
-
-        # ------------------------------------------------------------------
-        # Stage 2: EXTRACTION
-        # PYQ Papers -> Dedicated Scanned Image Rendering & OCR
-        # Study Materials -> Deterministic Native Text with OCR Fallback
-        # ------------------------------------------------------------------
-        print(f"[Pipeline] Stage 2: TEXT_EXTRACTION ({document_type})")
-        if document_type == 'PYQ':
-            extracted_text, ocr_confidence = self.ocr.extract_paper_text(local_path)
-        else:
-            extracted_text, ocr_confidence = self.ocr.extract_material_text(local_path)
-
-        if not extracted_text:
-            self._update_job_status(job_id, "FAILED", "TEXT_EXTRACTION", [], [])
-            return {
-                "success": False,
-                "status": "FAILED",
-                "stage": "TEXT_EXTRACTION",
-                "error": "No legible text could be extracted from document."
-            }
-
-        # ------------------------------------------------------------------
-        # Stage 3: QUESTION SEGMENTATION (Atomic Subquestions)
-        # ------------------------------------------------------------------
-        print("[Pipeline] Stage 3: QUESTION_SEGMENTATION")
-        questions = self.llm.segment_questions(extracted_text)
-
-        # ------------------------------------------------------------------
-        # Stage 4: TOPIC CLASSIFICATION & CONFIDENCE SCORING
-        # ------------------------------------------------------------------
-        print("[Pipeline] Stage 4: CLASSIFICATION")
-        low_confidence_reasons: List[str] = []
-
-        if ocr_confidence < CONFIDENCE_THRESHOLD:
-            low_confidence_reasons.append(f"OCR mean confidence ({ocr_confidence:.2f}) below threshold ({CONFIDENCE_THRESHOLD})")
-
-        # The regex fallback (used when the LLM is unavailable) can't see question numbers
-        # that OCR dropped - common when they sit in a table column - so it may merge many
-        # questions into one. Its output always needs a human check.
-        if questions == _regex_segment_questions(extracted_text):
-            low_confidence_reasons.append("Questions were split by the regex fallback (LLM unavailable); numbering may be incomplete")
-
-        coverage = _segmentation_coverage(extracted_text, questions)
-        if coverage < MIN_SEGMENTATION_COVERAGE:
-            low_confidence_reasons.append(f"Questions cover only {coverage:.0%} of the extracted text; some questions may be missing")
-
-        # Fetch real syllabus topics for this course
-        candidate_topics = self._fetch_course_topics(course_code)
-
-        # Generate question crop paths & classify topics
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
-        if not year:
-            year = _detect_year(extracted_text)
-
-        year_label = str(year) if year else "unknown"
-        crops_dir = os.path.join(root_dir, 'local_storage', 'crops', str(course_code), year_label)
-        os.makedirs(crops_dir, exist_ok=True)
-
-        # Map each question to its corresponding PDF page and generate accurate crop
-        pages_raw = re.split(r'--- (?:Question Paper Page|Slide/Page|Page) (\d+) ---', extracted_text)
-        page_texts: Dict[int, str] = {}
-        for i in range(1, len(pages_raw), 2):
+    def process_job(self, job_id, record):
+        headers = {'x-internal-worker-key': os.getenv('WORKER_INTERNAL_KEY', '')}
+        result = {'jobId': job_id, 'leaseToken': record['leaseToken'], 'status': 'RETRY_PENDING', 'stage': 'CLOUD_EXTRACTION', 'questions': [], 'reviewReasons': [], 'extractionVersion': EXTRACTION_VERSION}
+        with httpx.Client(timeout=150, headers=headers) as client:
             try:
-                page_texts[int(pages_raw[i])] = pages_raw[i + 1]
-            except (ValueError, IndexError):
-                pass
-
-        try:
-            pdf_doc = pymupdf.open(local_path)
-        except Exception as doc_err:
-            print(f"[Pipeline] Could not open PDF for crop extraction: {doc_err}")
-            pdf_doc = None
-
-        # 1. Determine target page for each question via keyword overlap
-        for q in questions:
-            target_page_idx = 0
-            if page_texts:
-                best_overlap = -1
-                q_words = set(re.findall(r'\w{3,}', q.get('extractedText', '').lower()))
-                for p_num, p_txt in page_texts.items():
-                    p_words = set(re.findall(r'\w{3,}', p_txt.lower()))
-                    overlap = len(q_words.intersection(p_words))
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        target_page_idx = max(0, p_num - 1)
-            q['target_page_idx'] = target_page_idx
-
-        # 2. Extract crops grouped by page with accurate bounding boxes
-        if pdf_doc:
-            for p_idx in range(len(pdf_doc)):
-                page_obj = pdf_doc[p_idx]
-                page_qs = [q for q in questions if q.get('target_page_idx', 0) == p_idx]
-                if not page_qs:
-                    continue
-
-                # Locate vertical start coordinate (y0) for each question on this page
-                located_qs = []
-                for idx, q in enumerate(page_qs):
-                    q_num = q.get('questionNumber', 'Q')
-                    search_rects = page_obj.search_for(q_num)
-                    y0 = -1
-                    if search_rects:
-                        y0 = search_rects[0].y0
+                with tempfile.TemporaryDirectory(prefix='cpyq-') as directory:
+                    path = os.path.join(directory, 'document.pdf')
+                    if not self.storage.download_file(record['s3Key'], path):
+                        raise ProviderFailure('Could not download PDF; check storage configuration')
+                    content = Path(path).read_bytes()
+                    if len(content) > 25 * 1024 * 1024:
+                        raise ProviderFailure('PDF exceeds the 25 MB processing limit')
+                    result['fileHash'] = hashlib.sha256(content).hexdigest()
+                    with fitz.open(path) as pdf:
+                        if pdf.needs_pass or not 0 < len(pdf) <= 200:
+                            raise ProviderFailure('PDF must be readable, unencrypted and have 1–200 pages')
+                        page_count = len(pdf)
+                    response = client.get(f'{FRONTEND_URL}/api/jobs/context', params={'jobId': job_id}, headers={'x-job-lease': record['leaseToken']})
+                    response.raise_for_status()
+                    context = response.json()
+                    result['syllabusVersionId'] = context['syllabusVersionId']
+                    if record['documentType'] == 'STUDY_MATERIAL':
+                        result['extractionVersion'] = MATERIAL_EXTRACTION_VERSION
+                        result['stage'] = 'NOTES_EXTRACTION'
+                        result['pageCount'] = page_count
+                        cached = {page['pageIndex']: page for page in (context.get('material') or {}).get('pages', [])
+                                  if page['fileHash'] == result['fileHash'] and page['extractionVersion'] == MATERIAL_EXTRACTION_VERSION}
+                        with fitz.open(path) as pdf:
+                            for index, page in enumerate(pdf):
+                                if index in cached:
+                                    continue
+                                checkpoint = extract_material_page(page, index, self.cloud)
+                                response = client.post(f'{FRONTEND_URL}/api/jobs/material-page', json={
+                                    'jobId': job_id, 'leaseToken': record['leaseToken'], 'fileHash': result['fileHash'],
+                                    'extractionVersion': MATERIAL_EXTRACTION_VERSION, 'pageCount': page_count, 'page': checkpoint})
+                                response.raise_for_status()
+                        result.update(status='AUTO_PUBLISHED', materialComplete=True, reviewedPages=list(range(page_count)), provider='native-or-cloud', stage='NOTES_COMPLETE')
+                        return self._save(client, result)
+                    # Duplicate lookup is version-aware. Legacy papers are re-extracted.
+                    if record['documentType'] == 'PYQ':
+                        duplicate = client.get(f'{FRONTEND_URL}/api/files/check-hash', params={'hash': result['fileHash'], 'jobId': job_id})
+                        duplicate.raise_for_status()
+                        original = duplicate.json()
+                        if original.get('exists') and original.get('analysisComplete') and original.get('syllabusVersionId') == context['syllabusVersionId']:
+                            result.update(status='AUTO_PUBLISHED', stage='DUPLICATE_REUSE', duplicateOfPaperId=original['paperId'], questions=original['questions'], analysisComplete=True, sharedInstructions=original.get('sharedInstructions', ''), pageCount=original.get('pageCount', page_count), reviewedPages=list(range(page_count)))
+                            if original.get('year'):
+                                result['year'] = original['year']
+                            return self._save(client, result)
+                    if record['documentType'] not in ('PYQ', 'CURRICULUM'):
+                        raise ProviderFailure('Only syllabi and question-paper PDFs are supported')
+                    extraction = self.cloud.extract(path, record['documentType'], page_count)
+                    reasons = list(extraction.issues)
+                    if not extraction.complete:
+                        reasons.append('Cloud extraction is incomplete; retry or reupload a clearer PDF')
+                    if extraction.courseCode and extraction.courseCode.upper() != record['courseCode']:
+                        reasons.append('Course code conflicts with printed header')
+                    if extraction.examType and extraction.examType != record.get('examType') and record['documentType'] == 'PYQ':
+                        reasons.append('Exam type conflicts with printed header')
+                    if extraction.year and record.get('year') and extraction.year != record['year']:
+                        reasons.append('Year conflicts with printed header')
+                    result.update(provider=self.cloud.provider, pageCount=page_count, reviewedPages=extraction.reviewedPages, sharedInstructions=extraction.sharedInstructions)
+                    if record['documentType'] == 'CURRICULUM':
+                        if not extraction.modules or extraction.questions:
+                            reasons.append('Syllabus modules missing or document is not a curriculum')
+                        result['curriculum'] = {'modules': [module.model_dump() for module in extraction.modules]} if extraction.modules else None
                     else:
-                        # Search by distinctive words from question start
-                        words = [w for w in re.findall(r'[A-Za-z0-9]+', q.get('extractedText', '')) if len(w) > 3][:4]
-                        if len(words) >= 2:
-                            s_rects = page_obj.search_for(' '.join(words[:2]))
-                            if s_rects:
-                                y0 = s_rects[0].y0
-                        if y0 == -1 and words:
-                            s_rects = page_obj.search_for(words[0])
-                            if s_rects:
-                                y0 = s_rects[0].y0
-                    located_qs.append((q, y0, idx))
+                        questions = [question.model_dump() for question in extraction.questions]
+                        labels = [question['questionNumber'] for question in questions]
+                        if not labels or len(labels) != len(set(labels)) or sorted(labels) != sorted(extraction.questionLabels):
+                            reasons.append('Question inventory is missing, repeated or incomplete')
+                        for question in questions:
+                            if any(not 0 <= page < page_count for page in question['sourcePages']):
+                                reasons.append('Invalid source-page reference')
+                            question['pageIndex'] = question['sourcePages'][0]
+                        if not context['syllabusVersionId'] or not context['topics']:
+                            reasons.append('An analysed syllabus is required before paper publication')
+                        if not reasons:
+                            atomic = [question for question in questions if question['marksScope'] != 'PARENT_TOTAL']
+                            assignments = self.cloud.classify(atomic, context).assignments
+                            assigned = {assignment.questionNumber: assignment for assignment in assignments}
+                            if len(assignments) != len(atomic) or set(assigned) != {question['questionNumber'] for question in atomic}:
+                                reasons.append('Classification omitted or repeated question labels')
+                            valid_topics = {topic['id'] for topic in context['topics']}
+                            valid_patterns = {pattern['id'] for pattern in context['patterns']}
+                            for question in atomic:
+                                assignment = assigned.get(question['questionNumber'])
+                                if not assignment:
+                                    continue
+                                if not set(assignment.topicIds) <= valid_topics or (assignment.patternId and assignment.patternId not in valid_patterns):
+                                    reasons.append('Classification used an unknown syllabus topic or pattern')
+                                question.update(assignment.model_dump(exclude={'questionNumber'}))
+                        result['questions'] = questions
+                        result['analysisComplete'] = not reasons
+                        if extraction.year or record.get('year'):
+                            result['year'] = extraction.year or record['year']
+                    result['reviewReasons'] = list(dict.fromkeys(reasons))
+                    result['status'] = 'RETRY_PENDING' if reasons else 'AUTO_PUBLISHED'
+                    result['qualityMetrics'] = {'ocrConfidence': 1 if not reasons else 0, 'segmentationCoverage': 1 if extraction.complete else 0, 'questionCount': len(result['questions']), 'checks': {'cloudDeclaredComplete': extraction.complete, 'reviewedPages': extraction.reviewedPages, 'questionLabels': extraction.questionLabels}}
+                    return self._save(client, result)
+            except Exception as error:
+                reason = str(error) if isinstance(error, ProviderFailure) else f'Cloud processing failed ({type(error).__name__}); check configuration and retry'
+                print(f'[Pipeline] Job {job_id}: {reason}', flush=True)
+                result.update(status='RETRY_PENDING', analysisComplete=False, reviewReasons=[reason], stage='FAILED')
+                if isinstance(error, ProviderFailure) and error.retry_after:
+                    result['retryAfterSeconds'] = error.retry_after
+                return self._save(client, result)
 
-                page_h = page_obj.rect.height
-                page_w = page_obj.rect.width
-                total_in_page = len(page_qs)
-
-                for q, y0, idx in located_qs:
-                    q_num = q.get('questionNumber', 'Q')
-                    clean_q_num = q_num.replace("(", "").replace(")", "").replace(" ", "_")
-                    crop_rel_path = f"crops/{course_code}/{year_label}/{clean_q_num}.png"
-                    crop_abs_path = os.path.join(crops_dir, f"{clean_q_num}.png")
-                    q['imageCropS3Key'] = crop_rel_path
-
-                    if y0 >= 0:
-                        top_y = max(0, y0 - 15)
-                        next_y = page_h
-                        for _, next_y0_cand, _ in located_qs:
-                            if next_y0_cand > y0 + 15 and next_y0_cand < next_y:
-                                next_y = next_y0_cand
-                        bot_y = min(page_h, max(top_y + 150, next_y - 5))
-                        clip_rect = pymupdf.Rect(0, top_y, page_w, bot_y)
-                    else:
-                        # Proportional vertical band slice (guarantees question snippet, never full page)
-                        band_h = page_h / total_in_page
-                        clip_rect = pymupdf.Rect(0, band_h * idx, page_w, band_h * (idx + 1))
-
-                    try:
-                        pix = page_obj.get_pixmap(clip=clip_rect, dpi=150)
-                        pix.save(crop_abs_path)
-                    except Exception as crop_err:
-                        print(f"[Pipeline] Crop generation note for {clean_q_num}: {crop_err}")
-
-            pdf_doc.close()
-
-        # 3. Topic classification for ALL questions — single batch API call
-        # Ensure every question has its imageCropS3Key set
-        for q in questions:
-            q_num = q.get('questionNumber', 'Q')
-            clean_q_num = q_num.replace("(", "").replace(")", "").replace(" ", "_")
-            if 'imageCropS3Key' not in q:
-                q['imageCropS3Key'] = f"crops/{course_code}/{year_label}/{clean_q_num}.png"
-
-        # Batch classify: 1 Gemini call for ALL questions instead of N calls
-        batch_results = self.llm.classify_questions_batch(questions, candidate_topics=candidate_topics or None)
-
-        # Build lookup from batch results
-        batch_lookup: Dict[str, Dict] = {}
-        for br in batch_results:
-            batch_lookup[br.get('questionNumber', '')] = br
-
-        # Results are returned in question order, so if the model rewrote a label
-        # (e.g. "Q1(a)" -> "Q1a") fall back to matching by position.
-        results_in_order = len(batch_results) == len(questions)
-
-        for i, q in enumerate(questions):
-            q_num = q.get('questionNumber', 'Q')
-            match = batch_lookup.get(q_num) or (batch_results[i] if results_in_order else {})
-            topic = match.get('topicName', 'General')
-            conf = float(match.get('confidence', 0.85))
-            q['topic'] = topic
-            q['confidence'] = conf
-
-            if conf < CONFIDENCE_THRESHOLD:
-                low_confidence_reasons.append(f"{q_num} topic confidence ({conf:.2f}) below threshold ({CONFIDENCE_THRESHOLD})")
-
-        # ------------------------------------------------------------------
-        # Stage 4b: SEMANTIC EMBEDDING (for pgvector similarity search)
-        # 1 batched Gemini call for every question in this paper. A missing/failed
-        # embedding is not a review-routing concern - it just means that question
-        # isn't semantically searchable yet, so it never affects final_status below.
-        # ------------------------------------------------------------------
-        print("[Pipeline] Stage 4b: SEMANTIC_EMBEDDING")
-        embeddings = self.llm.embed_questions([q.get('extractedText', '') for q in questions])
-        for q, embedding in zip(questions, embeddings):
-            q['embedding'] = embedding
-
-        # ------------------------------------------------------------------
-        # Stage 5: CONFIDENCE EVALUATION & REVIEW ROUTING
-        # ------------------------------------------------------------------
-        if low_confidence_reasons:
-            final_status = "REVIEW_REQUIRED"
-            print(f"[Pipeline] Route: REVIEW_REQUIRED -> {', '.join(low_confidence_reasons)}")
-        else:
-            final_status = "COMPLETED"
-            print(f"[Pipeline] Route: COMPLETED (High confidence on all {len(questions)} questions)")
-
-        # ------------------------------------------------------------------
-        # Stage 6: UPDATE DATABASE STATUS & PERSIST QUESTIONS
-        # ------------------------------------------------------------------
-        self._update_job_status(job_id, final_status, "COMPLETED", low_confidence_reasons, questions, year=year, file_hash=file_hash)
-
-        # Cleanup local working copy
-        try:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-        return {
-            "success": True,
-            "jobId": job_id,
-            "documentType": document_type,
-            "status": final_status,
-            "ocrConfidence": round(ocr_confidence, 2),
-            "reviewReasons": low_confidence_reasons,
-            "questions": questions,
-            "extractedTextLength": len(extracted_text)
-        }
-
-    def _update_job_status(self, job_id: str, status: str, stage: str, review_reasons: List[str], questions: List[Dict], year: Any = None, file_hash: str = None):
-        """Persist job status and extracted questions back to PostgreSQL via the Next.js API."""
-        try:
-            payload = {
-                "jobId": job_id,
-                "status": status,
-                "stage": stage,
-                "reviewReasons": review_reasons,
-                "questions": questions
-            }
-            if year:
-                payload["year"] = int(year)
-            if file_hash:
-                payload["fileHash"] = file_hash
-
-            with httpx.Client(timeout=15.0) as client:
-                update_res = client.post(
-                    f"{FRONTEND_URL}/api/jobs/update",
-                    json=payload,
-                    headers={"x-internal-worker-key": os.environ.get("WORKER_INTERNAL_KEY", "")}
-                )
-                if update_res.status_code == 200:
-                    print(f"[Pipeline] Successfully persisted status '{status}' and {len(questions)} questions in PostgreSQL.")
-                else:
-                    print(f"[Pipeline] Warning: DB update returned {update_res.status_code}: {update_res.text[:200]}")
-        except Exception as update_err:
-            print(f"[Pipeline] Database update communication error: {update_err}")
+    def _save(self, client, result):
+        if result.get('curriculum') is None:
+            result.pop('curriculum', None)
+        response = client.post(f'{FRONTEND_URL}/api/jobs/update', json=result)
+        response.raise_for_status()
+        return {'status': result['status']}

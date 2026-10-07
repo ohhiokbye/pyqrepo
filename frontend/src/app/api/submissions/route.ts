@@ -1,12 +1,15 @@
-import { NextResponse } from 'next/server'
+import { requireAdmin } from '@/lib/auth'
+import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { apiError } from '@/lib/apiError'
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const admin = requireAdmin(req)
+  if (admin instanceof NextResponse) return admin
   try {
     const submissions = await prisma.submission.findMany({
       orderBy: { submittedAt: 'desc' },
-      take: 10,
+      take: 100,
       include: {
         file: {
           include: {
@@ -29,7 +32,8 @@ export async function GET() {
                 course: true,
               },
             },
-            jobs: true,
+            jobs: { include: { qualityResult: true, attempts: true, retries: true } },
+            syllabusVersions: { include: { course: true } },
           },
         },
       },

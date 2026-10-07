@@ -33,3 +33,12 @@ def test_download_file_succeeds_for_valid_key(tmp_path):
 
     assert result is True
     assert dest.read_bytes() == b"%PDF-1.4 fake content"
+
+
+def test_download_blocks_symlink_escape(tmp_path):
+    provider = LocalFileSystemProvider()
+    provider.base_dir = str(tmp_path / 'storage')
+    (tmp_path / 'storage').mkdir()
+    (tmp_path / 'outside.pdf').write_bytes(b'private')
+    (tmp_path / 'storage' / 'linked.pdf').symlink_to(tmp_path / 'outside.pdf')
+    assert not provider.download_file('linked.pdf', str(tmp_path / 'output.pdf'))

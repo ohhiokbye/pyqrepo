@@ -29,7 +29,6 @@ export function CropPreview({ cropUrl, alt }: Props) {
           className="group block text-left border border-border rounded-md overflow-hidden hover:border-foreground/30 transition-colors bg-surface"
           title="Click to view full-resolution crop"
         >
-          {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src={cropUrl}
             alt={alt}
@@ -46,14 +45,13 @@ export function CropPreview({ cropUrl, alt }: Props) {
       {isOpen && (
         <div
           className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 sm:p-6"
-          onClick={() => setIsOpen(false)}
           role="dialog"
           aria-modal="true"
           aria-label={alt}
         >
+          <button type="button" tabIndex={-1} aria-label="Close image preview" className="absolute inset-0 cursor-default" onClick={() => setIsOpen(false)} />
           <div
             className="relative max-w-4xl max-h-[90vh] bg-surface border border-border rounded-xl shadow-2xl overflow-hidden flex flex-col"
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-background">
               <span className="text-xs font-mono text-muted-foreground">{alt}</span>
@@ -78,7 +76,6 @@ export function CropPreview({ cropUrl, alt }: Props) {
             </div>
 
             <div className="p-4 overflow-auto flex items-center justify-center bg-black/20 max-h-[calc(90vh-45px)]">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={cropUrl}
                 alt={alt}

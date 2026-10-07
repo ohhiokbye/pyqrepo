@@ -52,8 +52,6 @@ export function PaperFilters({
     [searchParams, pathname, router]
   )
 
-  const activeCourse = courses.find((c) => c.code === selectedCourseCode)
-
   return (
     <div className="bg-surface border border-border rounded-xl p-4 space-y-3 shadow-sm">
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -79,10 +77,10 @@ export function PaperFilters({
 
         {/* Exam Type Selector */}
         <div>
-          <label className="block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
+          <p className="block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
             Exam Type
-          </label>
-          <div className="flex gap-1 p-0.5 bg-muted rounded-lg" role="tablist">
+          </p>
+          <div className="flex gap-1 p-0.5 bg-muted rounded-lg" role="tablist" aria-label="Exam type">
             {EXAM_TYPES.map((et) => (
               <button
                 key={et.value}

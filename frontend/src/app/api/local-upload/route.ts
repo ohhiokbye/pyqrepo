@@ -1,85 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server'
-import fs from 'fs'
-import path from 'path'
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { verifyUploadToken } from '@/lib/storage/uploadToken'
 
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024 // 50MB maximum payload
-const ALLOWED_EXTENSIONS = new Set(['.pdf', '.pptx', '.png', '.jpg', '.jpeg'])
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
-// This endpoint is ONLY for local development to simulate S3 direct uploads
 export async function PUT(req: NextRequest) {
-  if (process.env.STORAGE_DRIVER === 's3') {
-    return NextResponse.json({ error: 'Not available in S3 mode' }, { status: 403 })
-  }
-
-  const searchParams = req.nextUrl.searchParams
-  const s3Key = searchParams.get('key')
-  const token = searchParams.get('token')
-
-  if (!s3Key) {
-    return NextResponse.json({ error: 'Missing key parameter' }, { status: 400 })
-  }
-
-  // The token is only issued by /api/upload/init (which is passphrase-gated),
-  // so this endpoint can't be used to write arbitrary files on its own.
-  if (!verifyUploadToken(s3Key, token)) {
-    return NextResponse.json({ error: 'Unauthorized or expired upload token' }, { status: 401 })
-  }
-
-  // Enforce base directory boundary and path traversal protection
-  const baseDir = path.resolve(process.cwd(), '..', 'local_storage')
-  const allowedPrefix = baseDir + path.sep
-  const resolvedPath = path.resolve(baseDir, s3Key)
-
-  if (!resolvedPath.startsWith(allowedPrefix)) {
-    return NextResponse.json({ error: 'Forbidden: Path traversal detected' }, { status: 403 })
-  }
-
-  // Validate allowed file extensions
-  const ext = path.extname(resolvedPath).toLowerCase()
-  if (!ALLOWED_EXTENSIONS.has(ext)) {
-    return NextResponse.json({ error: 'Invalid file extension' }, { status: 400 })
-  }
-
-  if (!req.body) {
-    return NextResponse.json({ error: 'No body provided' }, { status: 400 })
-  }
-
-  // Ensure target directory exists
-  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true })
-
-  const fileStream = fs.createWriteStream(resolvedPath)
-  const webStream = req.body
-  let totalBytes = 0
-
+  if (process.env.NODE_ENV === 'production' || process.env.STORAGE_DRIVER === 's3') return NextResponse.json({ error: 'Local uploads are development-only' }, { status: 403 })
+  const key = req.nextUrl.searchParams.get('key') || ''
+  if (!/^uploads\/submissions\/[a-zA-Z0-9._-]+\.pdf$/i.test(key)) return NextResponse.json({ error: 'Invalid PDF key' }, { status: 400 })
+  if (!verifyUploadToken(key, req.headers.get('x-upload-token'))) return NextResponse.json({ error: 'Unauthorized or expired upload token' }, { status: 401 })
+  if (!req.body) return NextResponse.json({ error: 'PDF body required' }, { status: 400 })
+  if (Number(req.headers.get('content-length')) > MAX_UPLOAD_BYTES) return NextResponse.json({ error: 'PDF exceeds 25 MB' }, { status: 413 })
+  const base = path.resolve(process.cwd(), '..', 'local_storage')
+  const parent = path.resolve(base, 'uploads/submissions')
+  const destination = path.resolve(base, key)
+  let temporary: string | undefined
+  let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+  const reader = req.body.getReader()
   try {
-    const reader = webStream.getReader()
+    await fs.mkdir(parent, { recursive: true })
+    if (await fs.realpath(parent) !== parent || await fs.realpath(base) !== base) return NextResponse.json({ error: 'Invalid storage directory' }, { status: 403 })
+    temporary = path.join(parent, `.upload-${randomUUID()}`)
+    handle = await fs.open(temporary, 'wx', 0o600)
+    let size = 0
+    let header = Buffer.alloc(0)
     while (true) {
-      const { done, value } = await reader.read()
+      const { value, done } = await reader.read()
       if (done) break
-      if (value) {
-        totalBytes += value.byteLength
-        if (totalBytes > MAX_UPLOAD_BYTES) {
-          fileStream.destroy()
-          if (fs.existsSync(resolvedPath)) {
-            fs.unlinkSync(resolvedPath)
-          }
-          return NextResponse.json(
-            { error: `File exceeds maximum allowed size of ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB` },
-            { status: 413 }
-          )
-        }
-        fileStream.write(Buffer.from(value))
-      }
+      size += value.byteLength
+      if (size > MAX_UPLOAD_BYTES) return NextResponse.json({ error: 'PDF exceeds 25 MB' }, { status: 413 })
+      if (header.length < 5) header = Buffer.concat([header, Buffer.from(value).subarray(0, 5 - header.length)])
+      if (header.length === 5 && header.toString('ascii') !== '%PDF-') return NextResponse.json({ error: 'Invalid PDF content' }, { status: 400 })
+      await handle.writeFile(value)
     }
-    fileStream.end()
-    return NextResponse.json({ success: true, key: s3Key })
+    if (size < 5 || header.toString('ascii') !== '%PDF-') return NextResponse.json({ error: 'Invalid PDF content' }, { status: 400 })
+    await handle.close(); handle = undefined
+    // Atomic write-once publication; replay cannot replace an existing PDF.
+    await fs.link(temporary, destination)
+    return NextResponse.json({ success: true, key })
   } catch (error) {
-    fileStream.destroy()
-    if (fs.existsSync(resolvedPath)) {
-      try { fs.unlinkSync(resolvedPath) } catch { /* ignore */ }
-    }
-    console.error("Local upload failed", error)
-    return NextResponse.json({ error: 'Upload processing failed' }, { status: 500 })
+    const code = (error as NodeJS.ErrnoException).code
+    return NextResponse.json({ error: code === 'EEXIST' ? 'PDF already uploaded. Prepare a new upload.' : 'Upload processing failed' }, { status: code === 'EEXIST' ? 409 : 500 })
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+    await handle?.close().catch(() => {})
+    if (temporary) await fs.unlink(temporary).catch(() => {})
   }
 }

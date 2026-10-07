@@ -1,175 +1,77 @@
+"""Outbound-only worker. Bind its optional health server to 127.0.0.1."""
 import asyncio
 import os
+from contextlib import asynccontextmanager
 import httpx
 from dotenv import load_dotenv
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from fastapi import FastAPI
 
-# Load .env from repository root (two levels up from worker/src/main.py)
-_root_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
-_project_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '.env')
-load_dotenv(_root_env)      # worker/.env (if exists)
-load_dotenv(_project_env)   # root .env (fallback, does not overwrite)
-
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '..', '.env'))
 from src.pipeline.processor import DocumentProcessor
 
-processor = DocumentProcessor()
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+HEADERS = {'x-internal-worker-key': os.environ.get('WORKER_INTERNAL_KEY', '')}
 
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-WORKER_INTERNAL_KEY = os.environ.get('WORKER_INTERNAL_KEY', '')
-
-class ProcessJobRequest(BaseModel):
-    jobId: str
-    s3Key: str
-    documentType: Optional[str] = "PYQ"
-    courseCode: Optional[str] = "BMAT202L"
-    year: Optional[int] = None
-
-# In-process fast-path guard to avoid redundant claim calls; NOT the source of
-# truth for correctness (a worker restart clears this). The real guard against
-# double-processing across restarts or multiple worker instances is the atomic
-# DB-level claim below.
-active_jobs: set[str] = set()
-
-async def claim_job(job_id: str) -> bool:
-    """Atomically flips a job from PENDING to PROCESSING via the frontend API.
-    Returns True only if this call won the claim."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            res = await client.post(
-                f"{FRONTEND_URL}/api/jobs/claim",
-                json={"jobId": job_id},
-                headers={"x-internal-worker-key": WORKER_INTERNAL_KEY},
-            )
-            if res.status_code == 200:
-                return bool(res.json().get("claimed"))
-    except Exception as e:
-        print(f"[Worker] Could not claim job {job_id}: {e}")
-    return False
+async def heartbeat(client, job_id, lease_token):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            result = await client.post(f'{FRONTEND_URL}/api/jobs/heartbeat', json={'jobId': job_id, 'leaseToken': lease_token})
+            if result.status_code == 409:
+                return
+        except httpx.HTTPError:
+            pass  # If connectivity stays down, the lease expires and the server retries.
 
 async def autonomous_job_poller():
-    """
-    Autonomous background loop:
-    Checks for any pending jobs every 15 seconds and executes the ingestion pipeline.
-    Ensures zero manual intervention even if an upload occurred while worker was starting up.
-    """
-    print("[Poller] Autonomous background poller started.")
-    await asyncio.sleep(5)  # Give Next.js time to boot
-    
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(f"{FRONTEND_URL}/api/submissions")
-                if res.status_code == 200:
-                    data = res.json()
-                    submissions = data.get("submissions", [])
-                    for sub in submissions:
-                        file_info = sub.get("file", {})
-                        jobs = file_info.get("jobs", [])
-                        for job in jobs:
-                            job_id = job.get("id")
-                            if job.get("status") == "PENDING" and job_id not in active_jobs:
-                                if not await claim_job(job_id):
-                                    continue  # lost the claim race, or frontend unreachable; retry next cycle
-                                active_jobs.add(job_id)
-                                s3_key = file_info.get("s3Key")
-                                
-                                # Correctly detect document type
-                                papers_list = file_info.get("papers") or []
-                                doc_type = "PYQ" if len(papers_list) > 0 else "STUDY_MATERIAL"
-                                paper = papers_list[0] if papers_list else {}
-                                course_code = (paper.get("course") or {}).get("code", "UNKNOWN")
-
-                                print(f"[Poller] Discovered PENDING Job: {job_id}. Triggering pipeline autonomously...")
-                                file_record = {
-                                    "id": job_id,
-                                    "s3Key": s3_key,
-                                    "documentType": doc_type,
-                                    "courseCode": course_code,
-                                    "year": paper.get("year")
-                                }
-                                try:
-                                    await asyncio.to_thread(processor.process_job, job_id, file_record)
-                                except Exception as proc_err:
-                                    print(f"[Poller] Processing error for {job_id}: {proc_err}")
-                                finally:
-                                    active_jobs.discard(job_id)
-        except Exception:
-            # Next.js may be restarting or idle; loop continues safely
-            pass
-
-        await asyncio.sleep(15)
-
+    processor = DocumentProcessor()
+    async with httpx.AsyncClient(timeout=20, headers=HEADERS) as client:
+        while True:
+            try:
+                response = await client.post(f'{FRONTEND_URL}/api/jobs/poll')
+                response.raise_for_status()
+                for job in response.json().get('jobs', []):
+                    claim = await client.post(f'{FRONTEND_URL}/api/jobs/claim', json={'jobId': job['id']})
+                    claim.raise_for_status()
+                    data = claim.json()
+                    if not data.get('claimed'):
+                        continue
+                    job['leaseToken'] = data['leaseToken']
+                    task = asyncio.create_task(heartbeat(client, job['id'], data['leaseToken']))
+                    try:
+                        await asyncio.to_thread(processor.process_job, job['id'], job)
+                    except Exception as error:
+                        # Never log provider request URLs or credentials.
+                        print(f"[Worker] Job {job['id']} failed ({type(error).__name__}); lease recovery will retry.")
+                    finally:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+            except httpx.ConnectError:
+                print('[Worker] Cannot connect to the frontend. Start npm --prefix frontend run dev '
+                      'and check FRONTEND_URL in worker/.env matches its port; retrying in 15s.', flush=True)
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                hint = 'Check WORKER_INTERNAL_KEY matches frontend/.env.' if status in (401, 403) else 'Check the frontend terminal and database connection.'
+                print(f'[Worker] Frontend returned HTTP {status}. {hint} Retrying in 15s.', flush=True)
+            except (httpx.HTTPError, ValueError, KeyError) as error:
+                print(f'[Worker] Poll unavailable ({type(error).__name__}); retrying.')
+            await asyncio.sleep(15)
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    poller_task = asyncio.create_task(autonomous_job_poller())
+async def lifespan(app):
+    task = asyncio.create_task(autonomous_job_poller())
     yield
-    poller_task.cancel()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
+app = FastAPI(title='CPYQ Outbound Worker', lifespan=lifespan)
 
-app = FastAPI(title="CPYQ Ingestion Worker", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "service": "CPYQ Ingestion Worker",
-        "version": "1.0.0"
-    }
-
-@app.post("/jobs/process")
-async def process_job(request: ProcessJobRequest, background_tasks: BackgroundTasks):
-    """
-    Direct dispatch endpoint called by Next.js finalize route.
-    Atomically claims the job in the DB (PENDING -> PROCESSING) so a concurrent
-    poller pass, worker restart, or duplicate dispatch can't double-process it.
-    """
-    if request.jobId in active_jobs:
-        return {
-            "status": "ALREADY_PROCESSING",
-            "jobId": request.jobId,
-            "message": "Job is already being processed."
-        }
-
-    if not await claim_job(request.jobId):
-        return {
-            "status": "CLAIM_FAILED",
-            "jobId": request.jobId,
-            "message": "Job was already claimed, or the claim could not be confirmed; the autonomous poller will retry it."
-        }
-
-    active_jobs.add(request.jobId)
-
-    file_record = {
-        "id": request.jobId,
-        "s3Key": request.s3Key,
-        "documentType": request.documentType,
-        "courseCode": request.courseCode,
-        "year": request.year
-    }
-
-    def run_and_cleanup(job_id: str, record: dict):
-        try:
-            processor.process_job(job_id, record)
-        finally:
-            active_jobs.discard(job_id)
-
-    background_tasks.add_task(run_and_cleanup, request.jobId, file_record)
-    
-    return {
-        "status": "ACCEPTED",
-        "jobId": request.jobId,
-        "message": "Ingestion pipeline running autonomously."
-    }
+@app.get('/health')
+def health():
+    return {'status': 'healthy', 'service': 'CPYQ Ingestion Worker'}

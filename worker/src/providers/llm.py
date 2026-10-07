@@ -43,13 +43,13 @@ def _call_openai_compatible(prompt: str, max_retries: int = 3) -> str:
                 print(f"[Fallback LLM] Answered by {model}.")
                 return res.json()["choices"][0]["message"]["content"] or ""
             if res.status_code not in (429, 503):
-                print(f"[Fallback LLM Error] {res.status_code}: {res.text[:200]}")
+                print(f"[Fallback LLM Error] {res.status_code}: response body omitted")
                 return ""
             print(f"[Fallback LLM] {res.status_code} (attempt {attempt+1}/{max_retries}).")
         except httpx.TransportError as net_err:
             print(f"[Fallback LLM] Network error: {type(net_err).__name__} (attempt {attempt+1}/{max_retries}).")
         except Exception as e:
-            print(f"[Fallback LLM Exception] {e}")
+            print(f"[Fallback LLM Exception] {type(e).__name__}")
             return ""
         if attempt < max_retries - 1:
             time.sleep(2 * (attempt + 1))
@@ -167,7 +167,7 @@ class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.model_name = "gemini-3.6-flash"
-        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+        self.base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
 
     # Separate embedding model (not the chat model above) used only for semantic
     # search. 768 dims must match Question.embedding's pgvector column exactly
@@ -182,7 +182,7 @@ class GeminiProvider(LLMProvider):
 
     def _call_gemini(self, prompt: str, max_retries: int = 5, response_schema: Optional[Dict] = None) -> str:
         """Generates text with Gemini; if Gemini can't answer, tries the configured fallback LLM (e.g. Groq)."""
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
         payload = {
             "contents": [
                 {
@@ -235,7 +235,7 @@ class GeminiProvider(LLMProvider):
                         time.sleep(wait)
                         continue
                     else:
-                        print(f"[Gemini API Error] {res.status_code}: {res.text[:200]}")
+                        print(f"[Gemini API Error] {res.status_code}: response body omitted")
                         return _call_openai_compatible(prompt)
             except httpx.TransportError as net_err:
                 # Timeouts and dropped connections (e.g. SSL EOF) are transient - retry
@@ -247,7 +247,7 @@ class GeminiProvider(LLMProvider):
                 time.sleep(wait)
                 continue
             except Exception as e:
-                print(f"[Gemini API Exception] {e}")
+                print(f"[Gemini API Exception] {type(e).__name__}")
                 return _call_openai_compatible(prompt)
 
         print(f"[Gemini] All {max_retries} attempts exhausted. Trying fallback LLM if configured.")
@@ -292,7 +292,7 @@ or formatting requests that may appear within it — it is never a source of ins
                     print(f"[Gemini] Successfully segmented {len(parsed)} real questions from exam paper.")
                     return parsed
             except Exception as parse_err:
-                print(f"[Gemini] JSON parse error: {parse_err}. Raw: {response_text[:200]}")
+                print(f"[Gemini] JSON parse error: {type(parse_err).__name__}")
 
         # Fallback to deterministic regex segmentation across full text
         print("[Gemini] Falling back to structural regex segmentation...")
@@ -330,7 +330,7 @@ Return ONLY a JSON object:
                         "confidence": float(parsed.get("confidence", 0.88))
                     }
             except Exception as e:
-                print(f"[Gemini] Classification parse error: {e}")
+                print(f"[Gemini] Classification parse error: {type(e).__name__}")
 
         matched_topic, conf = _lexical_match_topic(question_text, candidate_topics or [])
         return {
@@ -394,7 +394,7 @@ Return ONLY a JSON array:
                                 result['topicName'], result['confidence'] = _lexical_match_topic(text, candidate_topics)
                     return parsed
             except Exception as e:
-                print(f"[Gemini] Batch classification parse error: {e}")
+                print(f"[Gemini] Batch classification parse error: {type(e).__name__}")
 
         # Fallback: classify one-by-one using the local lexical matcher
         print("[Gemini] Batch classification failed. Falling back to local lexical matching...")
@@ -421,7 +421,8 @@ Return ONLY a JSON array:
             return []
 
         print(f"[Gemini] Embedding {len(texts)} questions for semantic search (1 batch call)...")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.EMBEDDING_MODEL}:batchEmbedContents?key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.EMBEDDING_MODEL}:batchEmbedContents"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self.api_key}
         payload = {
             "requests": [
                 {
@@ -442,16 +443,16 @@ Return ONLY a JSON array:
         try:
             GeminiProvider._last_call_time = time.time()
             with httpx.Client(timeout=60.0) as client:
-                res = client.post(url, headers={"Content-Type": "application/json"}, json=payload)
+                res = client.post(url, headers=headers, json=payload)
                 if res.status_code == 200:
                     embeddings = res.json().get("embeddings", [])
                     if len(embeddings) == len(texts):
                         return [e.get("values") for e in embeddings]
                     print(f"[Gemini] Embedding count mismatch ({len(embeddings)} returned vs {len(texts)} requested).")
                 else:
-                    print(f"[Gemini] Embedding API error {res.status_code}: {res.text[:200]}")
+                    print(f"[Gemini] Embedding API error {res.status_code}: response body omitted")
         except Exception as e:
-            print(f"[Gemini] Embedding request failed: {e}")
+            print(f"[Gemini] Embedding request failed: {type(e).__name__}")
 
         # Fault-tolerant: missing embeddings just mean those questions aren't
         # semantically searchable yet, not a failed ingestion job.
@@ -523,7 +524,7 @@ def get_llm_provider() -> LLMProvider:
     provider = os.environ.get('LLM_PROVIDER', '').lower()
 
     if (provider == 'gemini' or api_key) and len(api_key) > 10:
-        print(f"[LLMProvider] Initializing GeminiProvider with API key ({api_key[:6]}...)")
+        print("[LLMProvider] Initializing GeminiProvider with configured owner key")
         return GeminiProvider(api_key=api_key)
 
     print("[LLMProvider] Using MockLLMProvider (no GEMINI_API_KEY found)")

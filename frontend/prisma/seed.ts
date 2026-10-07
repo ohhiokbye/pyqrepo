@@ -390,22 +390,10 @@ async function main() {
 
     // Upsert modules and topics
     for (const m of courseDef.modules) {
-      const moduleRecord = await prisma.module.upsert({
-        where: {
-          courseId_moduleNo: {
-            courseId: course.id,
-            moduleNo: m.moduleNo
-          }
-        },
-        update: {
-          name: m.name
-        },
-        create: {
-          courseId: course.id,
-          moduleNo: m.moduleNo,
-          name: m.name
-        }
-      })
+      const existingModule = await prisma.module.findFirst({ where: { courseId: course.id, moduleNo: m.moduleNo, syllabusVersionId: null } })
+      const moduleRecord = existingModule
+        ? await prisma.module.update({ where: { id: existingModule.id }, data: { name: m.name } })
+        : await prisma.module.create({ data: { courseId: course.id, moduleNo: m.moduleNo, name: m.name } })
 
       for (const topicName of m.topics) {
         const existingTopic = await prisma.topic.findFirst({

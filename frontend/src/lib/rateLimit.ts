@@ -15,6 +15,8 @@ export function checkRateLimit(key: string, limit: number, windowMs: number): bo
     for (const [k, bucket] of buckets) {
       if (now - bucket.windowStart > windowMs) buckets.delete(k)
     }
+    // Bound memory even when callers present many fresh identifiers.
+    if (buckets.size >= 10_000 && !buckets.has(key)) return false
   }
 
   const bucket = buckets.get(key)
@@ -28,7 +30,13 @@ export function checkRateLimit(key: string, limit: number, windowMs: number): bo
 }
 
 export function getClientIdentifier(req: NextRequest): string {
-  const forwardedFor = req.headers.get('x-forwarded-for')
-  if (forwardedFor) return forwardedFor.split(',')[0].trim()
-  return req.headers.get('x-real-ip') || 'unknown'
+  // @ts-expect-error ip property exists in some NextRequest runtimes
+  if (req.ip) return req.ip
+  const forwardedFor = process.env.VERCEL === '1' ? req.headers.get('x-vercel-forwarded-for') : process.env.TRUST_PROXY_HEADERS === '1' ? req.headers.get('x-forwarded-for') : null
+  if (forwardedFor) {
+    const parts = forwardedFor.split(',').map((p) => p.trim()).filter(Boolean)
+    // The rightmost entry is appended by the immediate trusted reverse proxy, preventing client spoofing
+    if (parts.length > 0) return parts[parts.length - 1]
+  }
+  return '127.0.0.1'
 }

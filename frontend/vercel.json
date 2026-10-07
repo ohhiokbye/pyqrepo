@@ -1,0 +1,8 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npx prisma generate && npm run build",
+  "functions": {
+    "src/app/api/jobs/update/route.ts": { "maxDuration": 120 },
+    "src/app/api/tutor/chat/route.ts": { "maxDuration": 120 }
+  }
+}

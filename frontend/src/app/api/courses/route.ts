@@ -15,7 +15,7 @@ export async function GET() {
       orderBy: { code: 'asc' },
     })
 
-    return NextResponse.json({ courses })
+    return NextResponse.json({ courses: courses.map((course) => ({ ...course, modules: course.modules.filter((module) => module.syllabusVersionId === course.activeSyllabusVersionId) })) })
   } catch (error) {
     return apiError('Failed to fetch courses:', error, 'Failed to fetch courses.')
   }

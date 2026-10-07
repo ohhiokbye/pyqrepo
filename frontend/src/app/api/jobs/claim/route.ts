@@ -1,34 +1,22 @@
+import { randomUUID } from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { apiError } from '@/lib/apiError'
+import { isWorker } from '@/lib/auth'
+import { LEASE_MS } from '@/lib/jobs/retry'
 
-/**
- * Atomically claims a PENDING job by flipping it to PROCESSING in a single
- * UPDATE ... WHERE, so the worker's in-memory "already processing" set is only
- * an optimization, not the source of truth. This is what actually prevents
- * double-processing across worker restarts or multiple worker instances.
- */
 export async function POST(req: NextRequest) {
-  const authHeader = req.headers.get('x-internal-worker-key')
-  const expectedKey = process.env.WORKER_INTERNAL_KEY
-
-  if (!expectedKey || authHeader !== expectedKey) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
+  if (!isWorker(req)) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
     const { jobId } = await req.json()
-    if (!jobId) {
-      return NextResponse.json({ error: 'jobId is required' }, { status: 400 })
-    }
-
-    const result = await prisma.processingJob.updateMany({
-      where: { id: jobId, status: 'PENDING' },
-      data: { status: 'PROCESSING' },
+    if (typeof jobId !== 'string' || !jobId) return NextResponse.json({ error: 'jobId is required' }, { status: 400 })
+    const leaseToken = randomUUID()
+    const now = new Date()
+    const claimed = await prisma.$transaction(async (tx) => {
+      const result = await tx.processingJob.updateMany({ where: { id: jobId, status: { in: ['PENDING', 'RETRY_PENDING'] }, nextRetryAt: { lte: now } }, data: { status: 'PROCESSING', leaseToken, leaseExpiresAt: new Date(now.getTime() + LEASE_MS), retryCount: { increment: 1 }, nextRetryAt: null } })
+      if (result.count) await tx.extractionAttempt.create({ data: { jobId, provider: 'pending', status: 'PROCESSING', details: { leaseToken } } })
+      return Boolean(result.count)
     })
-
-    return NextResponse.json({ claimed: result.count > 0 })
-  } catch (error) {
-    return apiError('Job claim error:', error, 'Failed to claim job.')
-  }
+    return NextResponse.json({ claimed, leaseToken: claimed ? leaseToken : null })
+  } catch (error) { return apiError('Job claim error:', error, 'Failed to claim job.') }
 }

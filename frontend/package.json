@@ -6,13 +6,18 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",
-    "next": "16.3.4",
+    "jose": "^6.2.12",
+    "next": "^16.3.8",
+    "ogl": "^1.0.11",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
     "uuid": "^14.0.2",
     "zod": "^4.5.4"
   },
@@ -23,15 +28,22 @@
     "@types/react-dom": "^19",
     "@types/uuid": "^10.0.0",
     "eslint": "^9",
-    "eslint-config-next": "16.3.4",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "prisma": "^6.19.3",
     "tailwindcss": "^4",
     "ts-node": "^10.9.2",
     "tsx": "^4.23.13",
-    "typescript": "^5"
+    "typescript": "^5",
+    "typescript-eslint": "^8.69.0"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
+  },
+  "overrides": {
+    "deepmerge-ts": "8.0.0",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
   }
-
 }

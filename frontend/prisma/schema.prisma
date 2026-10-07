@@ -19,6 +19,9 @@ model Course {
   modules   Module[]
   papers    Paper[]
   materials StudyMaterial[]
+  syllabusVersions SyllabusVersion[]
+  questionPatterns QuestionPattern[]
+  activeSyllabusVersionId String?
 }
 
 model Module {
@@ -28,8 +31,11 @@ model Module {
   moduleNo Int
   name     String
   topics   Topic[]
+  syllabusVersionId String?
+  syllabusVersion SyllabusVersion? @relation(fields: [syllabusVersionId], references: [id])
 
-  @@unique([courseId, moduleNo])
+  @@unique([syllabusVersionId, moduleNo])
+  @@index([courseId])
 }
 
 model Topic {
@@ -52,6 +58,7 @@ model File {
   jobs         ProcessingJob[]
   papers       Paper[]
   materials    StudyMaterial[]
+  syllabusVersions SyllabusVersion[]
 }
 
 model Submission {
@@ -73,6 +80,12 @@ model Paper {
   year      Int?
   
   questions Question[]
+  analysedSyllabusVersionId String?
+  extractionVersion String?
+  analysisComplete Boolean @default(false)
+  duplicateOfPaperId String?
+  sharedInstructions String?
+  publicationStatus String @default("PROCESSING") // PROCESSING, AUTO_PUBLISHED, RETRY_PENDING
 }
 
 model Question {
@@ -83,6 +96,14 @@ model Question {
   marks            Float?
   extractedText    String
   imageCropS3Key   String?
+  pageIndex        Int?
+  boundingBox      Json?
+  textHash         String?
+  duplicateOfId    String?
+  embeddingModel   String?
+
+  @@index([textHash])
+  @@index([patternId])
 
   // pgvector column (gemini-embedding-001, 768 dims) used for semantic retrieval:
   // lets the tutor find questions that match a student's meaning, not just their
@@ -90,6 +111,13 @@ model Question {
   // access goes through $queryRaw/$executeRaw (see lib/embeddings.ts). The vector
   // type comes from the pgvector extension enabled in the datasource block above.
   embedding        Unsupported("vector(768)")?
+
+  sourcePages Int[] @default([])
+  sharedInstructions String?
+  parentQuestionNumber String?
+  marksScope String @default("QUESTION")
+  patternId String?
+  pattern QuestionPattern? @relation(fields: [patternId], references: [id])
 
   questionTopics   QuestionTopic[]
 
@@ -115,6 +143,44 @@ model StudyMaterial {
   file         File   @relation(fields: [fileId], references: [id])
   title        String
   documentType String // e.g., PPT, NOTES, REFERENCE
+  publicationStatus String @default("PROCESSING")
+  extractionVersion String?
+  pageCount Int?
+  chunks MaterialChunk[]
+  pages MaterialPage[]
+}
+
+model MaterialPage {
+  id String @id @default(cuid())
+  materialId String
+  material StudyMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  pageIndex Int
+  fileHash String
+  extractionVersion String
+  text String
+  heading String
+  method String
+  @@unique([materialId, pageIndex])
+}
+
+model MaterialChunk {
+  id String @id @default(cuid())
+  materialId String
+  material StudyMaterial @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  position Int
+  text String
+  heading String
+  sourcePages Int[]
+  method String
+  extractionVersion String
+  @@unique([materialId, position])
+}
+
+model ApiRateLimit {
+  key String @id
+  count Int
+  expiresAt DateTime
+  @@index([expiresAt])
 }
 
 model ProcessingJob {
@@ -128,4 +194,69 @@ model ProcessingJob {
   retryCount    Int      @default(0)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  attempts      ExtractionAttempt[]
+  qualityResult QualityResult?
+  leaseToken    String?
+  leaseExpiresAt DateTime?
+  nextRetryAt   DateTime? @default(now())
+  retries       JobRetry[]
+
+  @@index([status, nextRetryAt])
+}
+
+model SyllabusVersion {
+  id          String   @id @default(cuid())
+  courseId    String
+  course      Course   @relation(fields: [courseId], references: [id])
+  fileId      String
+  file        File     @relation(fields: [fileId], references: [id])
+  version     Int
+  status      String   @default("AUTO_PUBLISHED")
+  extractedAt DateTime @default(now())
+  modules     Module[]
+
+  @@unique([courseId, version])
+}
+
+model ExtractionAttempt {
+  id        String        @id @default(cuid())
+  jobId     String
+  job       ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  provider  String
+  status    String
+  details   Json?
+  createdAt DateTime      @default(now())
+}
+
+model QualityResult {
+  id                    String        @id @default(cuid())
+  jobId                 String        @unique
+  job                   ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  ocrConfidence         Float
+  segmentationCoverage  Float
+  checks                Json?
+  questionCount         Int
+  reasons               Json?
+  createdAt             DateTime      @default(now())
+}
+
+model JobRetry {
+  id String @id @default(cuid())
+  jobId String
+  job ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  reason String
+  scheduledAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model QuestionPattern {
+  id String @id @default(cuid())
+  courseId String
+  course Course @relation(fields: [courseId], references: [id])
+  syllabusVersionId String
+  signature String
+  description String
+  questions Question[]
+
+  @@unique([courseId, syllabusVersionId, signature])
 }
